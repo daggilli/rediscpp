@@ -4,6 +4,7 @@
 #include <json/reader.h>
 #include <json/value.h>
 
+#include <algorithm>
 #include <concepts>
 #include <csignal>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <print>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,6 +28,8 @@
 #include <vector>
 
 #include "redisconfig.hpp"
+
+using namespace std::chrono_literals;
 
 namespace RedisCpp {
   inline std::once_flag sigSetup;
@@ -51,6 +55,7 @@ namespace RedisCpp {
   using Callback = std::function<void(std::string_view, std::string_view)>;
   using ReplyPointer = std::unique_ptr<redisReply, ReplyDeleter>;
   using ContextPointer = std::unique_ptr<redisContext, ContextDeleter>;
+  using SubscriberCallback = std::function<void(std::string_view, std::string_view, std::string_view)>;
 
   // ensure arguments are string_view or can construct a string_view implicitly. Do not allow
   // rvalue refs (temporaries) because they will dangle
@@ -124,6 +129,10 @@ namespace RedisCpp {
       return commandArgv(argv);
     }
 
+    [[nodiscard]] inline ReplyPointer publish(const char *const channel, const char *const message) {
+      return commandArgv({"PUBLISH", channel, message});
+    }
+
     [[nodiscard]] std::vector<std::string> vectoriseReply(ReplyPointer const &reply) {
       std::vector<std::string> replyVec{};
       if (reply->type == REDIS_REPLY_ARRAY) {
@@ -164,11 +173,94 @@ namespace RedisCpp {
       return listeners.erase(queueName) > 0;
     }
 
+    template <typename... Args>
+    requires(sizeof...(Args) >= 2) bool subscribe(Args &&...args) {
+      auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
+      constexpr std::size_t N = sizeof...(Args);
+
+      using CallbackArg = std::tuple_element_t<N - 1, decltype(argsTuple)>;
+      static_assert(std::constructible_from<SubscriberCallback, std::decay_t<CallbackArg>>,
+                    "subscribe: last argument must be a callable convertible to SubscriberCallback");
+      SubscriberCallback cb{std::get<N - 1>(argsTuple)};
+
+      auto channels = [&]<std::size_t... I>(std::index_sequence<I...>)->std::vector<std::string_view> {
+        using argDecltype = decltype(argsTuple);
+        static_assert(((std::convertible_to<std::decay_t<std::tuple_element_t<I, argDecltype>>,
+                                            std::string_view>)&&...),
+                      "subscribe: channel args must be string_view-like");
+        static_assert(
+            (!(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<I, argDecltype>>, std::string> &&
+               std::is_rvalue_reference_v<std::tuple_element_t<I, argDecltype>>)&&...),
+            "subscribe: rvalue std::string not allowed (temporary, would dangle)");
+        return std::vector<std::string_view>{std::string_view{std::get<I>(argsTuple)}...};
+      }
+      (std::make_index_sequence<N - 1>{});
+
+      channels.insert(channels.begin(), "SUBSCRIBE");
+
+      for (auto &c : channels) {
+        std::println(" CH: {}", c);
+      }
+
+      auto subscriber = [this, chans = std::move(channels),
+                         handler = std::move(cb)](std::stop_token tok) mutable {
+        auto ctx = createContext(config, false);
+        timeval tv{0, 200'000};  // 200 ms
+        ::redisSetTimeout(ctx.get(), tv);
+
+        auto subReplyPtr = commandArgv(ctx.get(), chans);
+
+        auto ix{0u};
+        while (!tok.stop_requested()) {
+          errno = 0;
+          redisReply *reply = nullptr;
+          auto result = ::redisGetReply(ctx.get(), std::bit_cast<void **>(&reply));
+          // std::println("==== RESULT {} {}", result, rx++);
+
+          if (result == REDIS_OK) {
+            auto replyPtr = ReplyPointer(static_cast<redisReply *>(reply));  // RAII
+            // handle pub/sub frame (RESP2 arrays: ["message", ch, payload], etc.)
+            std::println("SUB RCV OK {}", ix++);
+            auto elems = replyPtr->element;
+            if (replyPtr->element[2]->type == REDIS_REPLY_STRING) {
+              handler(elems[0]->str, elems[1]->str, elems[2]->str);
+            }
+            continue;
+          }
+
+          const int e = errno;
+          if (e == EAGAIN || e == EWOULDBLOCK || e == EINTR) {
+            // Just a timeout (or interrupted read) — not fatal. Go around and try again.
+            ctx->err = 0;
+            ctx->errstr[0] = '\0';
+            continue;
+          }
+
+          break;
+          // auto replyPtr = getReply(ctx.get());
+          // if (replyPtr) {
+          //   if (!subscribeReplyOk(ctx.get(), replyPtr)) {
+          //     throw std::runtime_error("Subscription read failed");
+          //   }
+          //   auto elems = replyPtr->element;
+
+          //   if (replyPtr->element[2]->type == REDIS_REPLY_STRING) {
+          //     handler(elems[0]->str, elems[1]->str, elems[2]->str);
+          //   }
+          // }
+        }
+      };
+
+      subscriberVec.emplace_back(subscriber);
+      return true;
+    }
+
    private:
     Config config;
     ContextPointer context;
     mutable std::mutex mx;
     ListenerMap listeners;
+    std::vector<std::jthread> subscriberVec;
 
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(redisContext *ctx, const char *format, Args &&...args) {
@@ -197,18 +289,36 @@ namespace RedisCpp {
       return replyPtr;
     }
 
-    ContextPointer createContext(const Config &cfg) {
+    [[nodiscard]] inline ReplyPointer getReply(redisContext *ctx) {
+      redisReply *reply;
+      auto result = ::redisGetReply(ctx, std::bit_cast<void **>(&reply));
+      std::println("RESULT {}", result);
+      if (result != REDIS_OK) {
+        if (ctx->err && ctx->err != REDIS_ERR_IO) {
+          throw std::runtime_error(
+              std::format("getReply failed (return value != {} {} {}", REDIS_OK, result, ctx->err));
+        }
+        return ReplyPointer(nullptr);
+      }
+      return ReplyPointer(reply);
+    }
+
+    ContextPointer createContext(const Config &cfg, bool allowResp3 = true) {
       auto ctx = ::redisConnect(cfg.hostname.c_str(), cfg.port);
       if (ctx == nullptr || ctx->err != 0) {
         throw std::runtime_error(std::format("Could not connect to Redis server: {}", ctx->err));
       }
       if (cfg.db.has_value()) {
-        auto setDatabase = std::format("SELECT {}", cfg.db.value());
+        auto setDatabase = std::format("SELECT {}", std::clamp(cfg.db.value(), 0, 16));
         auto setDatabasePtr = command(ctx, setDatabase.c_str());
-
-        if (setDatabasePtr == nullptr || setDatabasePtr->type != REDIS_REPLY_STATUS ||
-            setDatabasePtr->len != 2 || std::strncmp(setDatabasePtr->str, "OK", 2)) {
+        if (!statusReplyOk(ctx, setDatabasePtr)) {
           throw std::runtime_error("Could not set database");
+        }
+      }
+      if (allowResp3 && cfg.useResp3.value_or(false)) {
+        auto setResp3Ptr = command(ctx, "HELLO 3");
+        if (!replyOk(ctx, setResp3Ptr)) {
+          throw std::runtime_error("Could not upgrade to RESP3");
         }
       }
       if ((::redisEnableKeepAlive(ctx)) < 0) {
@@ -221,25 +331,51 @@ namespace RedisCpp {
       return ContextPointer(ctx);
     }
 
-    bool replyOk(redisContext *ctx, ReplyPointer const &reply) noexcept {
-      if (reply == nullptr || ctx->err) return false;
-      return true;
-    }
-    bool replyOk(redisContext *ctx, ReplyPointer const &reply, int expectedType) noexcept {
-      if (reply == nullptr || ctx->err || reply->type != expectedType) return false;
-      return true;
+    inline bool replyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err);
     }
 
-    bool bpopReplyOk(redisContext *ctx, ReplyPointer const &reply) {
-      if (reply == NULL || ctx->err) return false;
-      if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2) return false;
-      return true;
+    inline bool replyOk(redisContext *ctx, ReplyPointer const &replyPtr, int expectedType) noexcept {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == expectedType);
+    }
+
+    inline bool statusReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_STATUS &&
+              replyPtr->len == 2 && !std::strncmp(replyPtr->str, "OK", 2));
+    }
+
+    inline bool statusReplyMapOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_MAP &&
+              replyPtr->len % 2 == 0 && !std::strncmp(replyPtr->str, "OK", 2));
+    }
+
+    inline bool subscribeReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_ARRAY &&
+              replyPtr->elements == 3);
+    }
+
+    inline bool bpopReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_ARRAY &&
+              replyPtr->elements == 2);
     }
 
     template <satisfies_stringview... Args>
     void gatherArgs(std::vector<std::string_view> &onto, Args &&...args) {
       onto.reserve(onto.size() + sizeof...(Args));
       (onto.emplace_back(args), ...);
+    }
+
+    bool isSubscribePattern(const std::string_view str) {
+      std::ostringstream escaped;
+      for (auto i = str.begin(); i < str.end(); i++) {
+        if (*i == '\\') {  // ignore literal slash and subsequent character
+          i++;
+          continue;
+        }
+        escaped << *i;
+      }
+
+      return escaped.str().find_first_of("[]?*") != std::string::npos;
     }
 
     static inline void setSignals() {

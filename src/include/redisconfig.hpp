@@ -55,6 +55,7 @@ namespace RedisCpp {
         hostname = root["hostname"].asString();
         port = root["port"].asInt();
         db = root.isMember("db") ? std::optional<int>(root["db"].asInt()) : std::nullopt;
+        useResp3 = root.isMember("useresp3") ? std::optional<bool>(root["useresp3"].asBool()) : std::nullopt;
       }
     }
     Config &operator=(const Config &config) {
@@ -76,6 +77,7 @@ namespace RedisCpp {
     std::string hostname;
     int port;
     std::optional<int> db;
+    std::optional<bool> useResp3;
   };
 };  // namespace RedisCpp
 #endif

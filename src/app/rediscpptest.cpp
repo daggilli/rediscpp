@@ -7,6 +7,7 @@
 
 using namespace std::string_literals;
 using namespace std::chrono_literals;
+using namespace std::string_view_literals;
 
 struct QueueHandler {
   void operator()(const std::string_view qname, const std::string_view value) {
@@ -14,21 +15,34 @@ struct QueueHandler {
   }
 };
 
+struct SubscriptionHandler {
+  void operator()(const std::string_view type, const std::string_view channel,
+                  const std::string_view message) {
+    std::println("SUBSCRIPTION {} {} {}", type, channel, message);
+  }
+};
+
 int main() {
   RedisCpp::Config cfg("config/redisconfig.json");
   auto client = RedisCpp::Client(cfg);
 
-  QueueHandler qh;
-  auto added = client.addListener("testq", qh);
-  std::println("ADDED {}", added);
+  // auto pub = client.publish("testch", "a message");
 
-  auto newget = client.get("foox");
-  if (newget.has_value()) {
-    std::println("ASYNC OPTGET {}", newget.value());
-  }
+  // QueueHandler qh;
+  // auto added = client.addListener("testq", qh);
+  // std::println("ADDED {}", added);
+
+  // auto newget = client.get("foox");
+  // if (newget.has_value()) {
+  //   std::println("ASYNC OPTGET {}", newget.value());
+  // }
+
+  SubscriptionHandler sh;
+
+  client.subscribe("testch", "channel2", "wildcard", sh);
 
   auto ix = 0;
-  while (ix++ < 6) {
+  while (ix++ < 4) {
     std::this_thread::sleep_for(1s);
   }
 
