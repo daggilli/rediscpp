@@ -14,13 +14,19 @@
 namespace RedisCpp {
   namespace fs = std::filesystem;
 
+  constexpr const char *const DEFAULT_HOST = "localhost";
+  constexpr int DEFAULT_PORT = 6379;
+
   class Config {
    public:
-    explicit Config(const std::string &hostname_, int port_, int db_ = 0)
-        : hostname{std::move(hostname_)}, port{port_}, db{db_} {};
+    explicit Config(const std::string &hostname_, int port_, int db_ = 0,
+                    std::optional<std::string> un_ = std::nullopt,
+                    std::optional<std::string> pw_ = std::nullopt)
+        : hostname{std::move(hostname_)}, port{port_}, db{db_}, username(un_), password(pw_){};
     Config(const Config &config) = default;
     Config(Config &&config) = default;
-    Config(const fs::path &configFilePath) {
+    Config(const fs::path &configFilePath)
+        : db(std::nullopt), username(std::nullopt), password(std::nullopt) {
       auto filepath = fs::weakly_canonical(fs::absolute(configFilePath));
       if (!fs::exists(filepath))
         throw std::runtime_error(std::format("Configuration file not found at: {}", filepath.string()));
@@ -52,10 +58,19 @@ namespace RedisCpp {
           throw std::runtime_error(std::format("Config file parse error: {}", err));
         }
 
-        hostname = root["hostname"].asString();
-        port = root["port"].asInt();
-        db = root.isMember("db") ? std::optional<int>(root["db"].asInt()) : std::nullopt;
+        hostname = root.isMember("hostname") ? root["hostname"].asString() : DEFAULT_HOST;
+        port = root.isMember("port") ? root["port"].asInt() : DEFAULT_PORT;
+        if (root.isMember("db")) {
+          db = root["db"].asInt();
+        }
         useResp3 = root.isMember("useresp3") ? std::optional<bool>(root["useresp3"].asBool()) : std::nullopt;
+        useAuth = root.isMember("useauth") && root.isMember("password") ? root["useauth"].asBool() : false;
+        if (useAuth) {
+          password = std::optional<std::string>(root["password"].asString());
+          if (root.isMember("username")) {
+            username = root["username"].asString();
+          }
+        }
       }
     }
     Config &operator=(const Config &config) {
@@ -78,6 +93,9 @@ namespace RedisCpp {
     int port;
     std::optional<int> db;
     std::optional<bool> useResp3;
+    bool useAuth;
+    std::optional<std::string> username;
+    std::optional<std::string> password;
   };
 };  // namespace RedisCpp
 #endif

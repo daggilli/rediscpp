@@ -1,6 +1,9 @@
 #include <cstdint>
 #include <print>
+#include <span>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include "redisconfig.hpp"
 #include "rediscpp.hpp"
@@ -16,9 +19,12 @@ struct QueueHandler {
 };
 
 struct SubscriptionHandler {
-  void operator()(const std::string_view type, const std::string_view channel,
-                  const std::string_view message) {
-    std::println("SUBSCRIPTION {} {} {}", type, channel, message);
+  void operator()(std::span<std::string_view> elements) {
+    std::print("SUB MSG: ");
+    for (auto& elem : elements) {
+      std::print("{} ", elem);
+    }
+    std::println("");
   }
 };
 
@@ -39,12 +45,15 @@ int main() {
 
   SubscriptionHandler sh;
 
-  client.subscribe("testch", "channel2", "wildcard", sh);
+  client.subscribe("testch", "channel2", "wildcard*", sh);
 
-  auto ix = 0;
-  while (ix++ < 4) {
+  // auto ix = 0;
+  // while (ix++ < 40) {
+  //   std::this_thread::sleep_for(1s);
+  // }
+
+  while (true) {
     std::this_thread::sleep_for(1s);
   }
-
   return 0;
 }
