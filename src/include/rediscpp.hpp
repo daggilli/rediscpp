@@ -14,6 +14,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -56,11 +57,17 @@ namespace RedisCpp {
     }
   };
 
+  struct Subscriber {
+    std::jthread subThread;
+    std::shared_future<void> finished;
+  };
+
   using ListenerMap = std::unordered_map<std::string, std::jthread>;
   using Callback = std::function<void(std::string_view, std::string_view)>;
   using ReplyPointer = std::unique_ptr<redisReply, ReplyDeleter>;
   using ContextPointer = std::unique_ptr<redisContext, ContextDeleter>;
   using SubscriberCallback = std::function<void(std::span<std::string_view>)>;
+  using SubscriberVec = std::vector<Subscriber>;
 
   // ensure arguments are string_view or can construct a string_view implicitly. Do not allow
   // rvalue refs (temporaries) because they will dangle
@@ -83,6 +90,11 @@ namespace RedisCpp {
         lthread.request_stop();
       }
       listeners.clear();
+
+      auto subLock = std::scoped_lock(subscriberMutex);
+      for (auto &&sub : subscriberVec) {
+        sub.subThread.request_stop();
+      }
     }
     Client operator=(const Client &cli) = delete;
     Client &operator=(Client &&cli) {
@@ -217,60 +229,96 @@ namespace RedisCpp {
         return std::make_pair(chans, patChans);
       }(allChannels);
 
+      auto subPromise = std::make_shared<std::promise<void>>();
+      auto finished = subPromise->get_future().share();
+
       auto subscriber = [this, chans = std::move(channels), patChans = std::move(patChannels),
-                         handler = std::move(cb)](std::stop_token tok) mutable {
+                         handler = std::move(cb), subPromise](std::stop_token tok) mutable {
         auto ctx = connectAndSubscribe(config, chans, patChans);
 
         auto contextFileDesc = ctx->fd;
-        int eventFileDesc = eventfd(0, EFD_NONBLOCK);
+        int eventFileDesc;
+        if ((eventFileDesc = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
+          try {
+            subPromise->set_value();
+          } catch (...) {
+          }
+          return;
+        }
+
         pollfd pfds[2] = {{contextFileDesc, POLLIN, 0}, {eventFileDesc, POLLIN, 0}};
 
-        while (!tok.stop_requested()) {
-          auto pollResult = ::poll(pfds, 2, 200);
+        {
+          std::stop_callback onRequestStop(tok, [efd = eventFileDesc] {
+            std::println("STOP CB");
+            uint64_t one = 1;
+            (void)::write(efd, &one, sizeof(one));
+          });
 
-          if (pollResult == 0) continue;  // timeout
-
-          if (pollResult < 0) {
-            if (errno == EINTR) continue;
-            break;
+          if (tok.stop_requested()) {
+            uint64_t one = 1;
+            (void)::write(eventFileDesc, &one, sizeof(one));
           }
 
-          // TODO
-          if (pfds[1].revents & POLLIN) {
-            std::println("STOP ON WAKE");
-            uint64_t tmp;
-            ::read(eventFileDesc, &tmp, sizeof tmp);
-            break;
-          }
-
-          // socket died: attempt to reccreate context with exponential backoff
-          if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            std::chrono::milliseconds backoff{100};
-            auto maxRetries{8u};
-            auto retries{0u};
-
+          while (true) {
+            int pollResult;
             do {
-              ctx = connectAndSubscribe(config, chans, patChans);
-              if (ctx->err) {
-                std::this_thread::sleep_for(backoff);
-                retries++;
-                backoff *= 2;
-                continue;
-              }
-            } while (ctx->err && retries < maxRetries);
-            if (ctx->err || retries == maxRetries) break;
+              pollResult = ::poll(pfds, 2, -1);  // block; eventfd wakes us
+            } while (pollResult < 0 && errno == EINTR);
 
-            pfds[0].fd = ctx->fd;
-            continue;
-          }
+            if (pollResult == 0) continue;  // timeout
 
-          if (pfds[0].revents & POLLIN) {  // readable
-            handleSubscriptionMessage(ctx.get(), std::move(handler));
+            if (pollResult < 0) {
+              if (errno == EINTR) continue;
+              break;
+            }
+
+            if (pfds[1].revents & POLLIN) {
+              std::println("STOP ON WAKE");
+              uint64_t tmp;
+              (void)::read(eventFileDesc, &tmp, sizeof tmp);
+              std::println("WAKE EXIT");
+              break;
+            }
+
+            // socket died: attempt to reccreate context with exponential backoff
+            if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+              std::chrono::milliseconds backoff{100};
+              auto maxRetries{8u};
+              auto retries{0u};
+
+              do {
+                ctx = connectAndSubscribe(config, chans, patChans);
+                if (ctx->err) {
+                  std::this_thread::sleep_for(backoff);
+                  retries++;
+                  backoff *= 2;
+                  continue;
+                }
+              } while (ctx->err && retries < maxRetries);
+              if (ctx->err || retries == maxRetries) break;
+
+              pfds[0].fd = ctx->fd;
+              continue;
+            }
+
+            if (pfds[0].revents & POLLIN) {  // readable
+              handleSubscriptionMessage(ctx.get(), std::move(handler));
+            }
           }
+        }
+        std::println("EXIT THREAD");
+        (void)::close(eventFileDesc);
+        try {
+          subPromise->set_value();
+        } catch (...) {
         }
       };
 
-      subscriberVec.emplace_back(subscriber);
+      {
+        auto subLock = std::scoped_lock(subscriberMutex);
+        subscriberVec.emplace_back(Subscriber{std::jthread(std::move(subscriber)), finished});
+      }
       return true;
     }
 
@@ -279,7 +327,8 @@ namespace RedisCpp {
     ContextPointer context;
     mutable std::mutex listenerMutex;
     ListenerMap listeners;
-    std::vector<std::jthread> subscriberVec;
+    mutable std::mutex subscriberMutex;
+    SubscriberVec subscriberVec;
 
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(redisContext *ctx, const char *format, Args &&...args) {
@@ -421,6 +470,19 @@ namespace RedisCpp {
       }
 
       return elementVec;
+    }
+
+    void reapSubscribers() {
+      auto subLock = std::scoped_lock(subscriberMutex);
+      std::erase_if(subscriberVec, [](Subscriber &sub) {
+        if (sub.finished.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+          if (sub.subThread.joinable()) sub.subThread.join();
+          std::println("REAP TRUE");
+          return true;  // erase
+        }
+        std::println("REAP FALSE");
+        return false;  // keep
+      });
     }
 
     inline bool replyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {

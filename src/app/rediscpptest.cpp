@@ -19,13 +19,15 @@ struct QueueHandler {
 };
 
 struct SubscriptionHandler {
+  SubscriptionHandler(const std::string& name_) : name(name_) {}
   void operator()(std::span<std::string_view> elements) {
-    std::print("SUB MSG: ");
+    std::print("SUB MSG [{}]: ", name);
     for (auto& elem : elements) {
       std::print("{} ", elem);
     }
     std::println("");
   }
+  std::string name;
 };
 
 int main() {
@@ -43,17 +45,18 @@ int main() {
   //   std::println("ASYNC OPTGET {}", newget.value());
   // }
 
-  SubscriptionHandler sh;
+  SubscriptionHandler sh("thing1"), sh2("thing2");
 
   client.subscribe("testch", "channel2", "wildcard*", sh);
+  client.subscribe("also", sh2);
 
-  // auto ix = 0;
-  // while (ix++ < 40) {
-  //   std::this_thread::sleep_for(1s);
-  // }
-
-  while (true) {
+  auto ix = 0;
+  while (ix++ < 40) {
     std::this_thread::sleep_for(1s);
   }
+
+  /* while (true) {
+    std::this_thread::sleep_for(1s);
+  } */
   return 0;
 }
