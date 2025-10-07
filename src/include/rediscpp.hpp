@@ -7,9 +7,11 @@
 #include <sys/eventfd.h>
 
 #include <algorithm>
+#include <array>
 #include <concepts>
 #include <csignal>
 #include <cstring>
+#include <deque>
 #include <expected>
 #include <format>
 #include <fstream>
@@ -19,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <print>
+#include <randomint.hpp>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -32,9 +35,7 @@
 
 #include "redisconfig.hpp"
 
-//
 using namespace std::string_literals;
-//
 using namespace std::chrono_literals;
 
 namespace RedisCpp {
@@ -57,9 +58,32 @@ namespace RedisCpp {
     }
   };
 
+  enum class Command { UNSUBSCRIBE, PUNSUBSCRIBE, UNSUBSCRIBEALL, TERMINATE };
+
+  struct Message {
+    Command command;
+    std::vector<std::string_view> channels;
+  };
+
+  struct MessageQueue {
+    void drain() {
+      uint64_t tmp;
+      (void)::read(signalFileDesc, &tmp, sizeof(tmp));
+    }
+    void wakeup() {
+      uint64_t one = 1;
+      (void)::write(signalFileDesc, &one, sizeof(one));
+    }
+    int signalFileDesc{-1};
+    std::mutex queueMutex;
+    std::deque<Message> messages;
+    std::atomic_bool terminate{false};
+  };
+
   struct Subscriber {
     std::jthread subThread;
     std::shared_future<void> finished;
+    std::shared_ptr<MessageQueue> queuePtr;
   };
 
   using ListenerMap = std::unordered_map<std::string, std::jthread>;
@@ -68,6 +92,8 @@ namespace RedisCpp {
   using ContextPointer = std::unique_ptr<redisContext, ContextDeleter>;
   using SubscriberCallback = std::function<void(std::span<std::string_view>)>;
   using SubscriberVec = std::vector<Subscriber>;
+  using SubscriberMap = std::unordered_map<uint64_t, Subscriber>;
+  using IdGenerator = RandomInt::RandomUint64Generator;
 
   // ensure arguments are string_view or can construct a string_view implicitly. Do not allow
   // rvalue refs (temporaries) because they will dangle
@@ -81,6 +107,7 @@ namespace RedisCpp {
     explicit Client(const Config &cfg) : config{cfg} {
       Client::setSignals();
       context = createContext(config);
+      startReaper();
     }
     Client(const Client &cli) = delete;
     Client(Client &&cli) : config{std::move(cli.config)}, context{std::exchange(cli.context, nullptr)} {}
@@ -90,11 +117,6 @@ namespace RedisCpp {
         lthread.request_stop();
       }
       listeners.clear();
-
-      auto subLock = std::scoped_lock(subscriberMutex);
-      for (auto &&sub : subscriberVec) {
-        sub.subThread.request_stop();
-      }
     }
     Client operator=(const Client &cli) = delete;
     Client &operator=(Client &&cli) {
@@ -191,17 +213,17 @@ namespace RedisCpp {
     }
 
     template <typename... Args>
-    requires(sizeof...(Args) >= 2) bool subscribe(Args &&...args) {
+    requires(sizeof...(Args) >= 2) [[nodiscard]] uint64_t subscribe(Args &&...args) {
       auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
       constexpr std::size_t N = sizeof...(Args);
+      using argDecltype = decltype(argsTuple);
 
-      using CallbackArg = std::tuple_element_t<N - 1, decltype(argsTuple)>;
+      using CallbackArg = std::tuple_element_t<N - 1, argDecltype>;
       static_assert(std::constructible_from<SubscriberCallback, std::decay_t<CallbackArg>>,
                     "subscribe: last argument must be a callable convertible to SubscriberCallback");
       SubscriberCallback cb{std::get<N - 1>(argsTuple)};
 
       auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>)->std::vector<std::string_view> {
-        using argDecltype = decltype(argsTuple);
         static_assert(((std::convertible_to<std::decay_t<std::tuple_element_t<I, argDecltype>>,
                                             std::string_view>)&&...),
                       "subscribe: channel args must be string_view-like");
@@ -229,16 +251,18 @@ namespace RedisCpp {
         return std::make_pair(chans, patChans);
       }(allChannels);
 
+      auto messageQueuePtr = std::make_shared<MessageQueue>();
+
       auto subPromise = std::make_shared<std::promise<void>>();
       auto finished = subPromise->get_future().share();
 
       auto subscriber = [this, chans = std::move(channels), patChans = std::move(patChannels),
-                         handler = std::move(cb), subPromise](std::stop_token tok) mutable {
+                         handler = std::move(cb), subPromise,
+                         mqPtr = messageQueuePtr](std::stop_token tok, uint64_t id) mutable {
         auto ctx = connectAndSubscribe(config, chans, patChans);
 
         auto contextFileDesc = ctx->fd;
-        int eventFileDesc;
-        if ((eventFileDesc = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
+        if ((mqPtr->signalFileDesc = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0) {
           try {
             subPromise->set_value();
           } catch (...) {
@@ -246,27 +270,31 @@ namespace RedisCpp {
           return;
         }
 
-        pollfd pfds[2] = {{contextFileDesc, POLLIN, 0}, {eventFileDesc, POLLIN, 0}};
+        pollfd pfds[2] = {{contextFileDesc, POLLIN, 0}, {mqPtr->signalFileDesc, POLLIN, 0}};
 
         {
-          std::stop_callback onRequestStop(tok, [efd = eventFileDesc] {
-            std::println("STOP CB");
-            uint64_t one = 1;
-            (void)::write(efd, &one, sizeof(one));
+          std::stop_callback onRequestStop(tok, [mqPtr] {
+            mqPtr->terminate.store(true, std::memory_order_release);
+            mqPtr->wakeup();
           });
 
-          if (tok.stop_requested()) {
-            uint64_t one = 1;
-            (void)::write(eventFileDesc, &one, sizeof(one));
-          }
+          bool done{false};
 
-          while (true) {
+          auto drain = [](int fd) {
+            uint64_t tmp;
+            (void)::read(fd, &tmp, sizeof tmp);
+          };
+
+          while (!done) {
+            if (mqPtr->terminate.load(std::memory_order_acquire)) {
+              done = true;
+              break;
+            }
+
             int pollResult;
             do {
               pollResult = ::poll(pfds, 2, -1);  // block; eventfd wakes us
             } while (pollResult < 0 && errno == EINTR);
-
-            if (pollResult == 0) continue;  // timeout
 
             if (pollResult < 0) {
               if (errno == EINTR) continue;
@@ -274,15 +302,62 @@ namespace RedisCpp {
             }
 
             if (pfds[1].revents & POLLIN) {
-              std::println("STOP ON WAKE");
+              mqPtr->drain();
               uint64_t tmp;
-              (void)::read(eventFileDesc, &tmp, sizeof tmp);
-              std::println("WAKE EXIT");
-              break;
+              (void)::read(mqPtr->signalFileDesc, &tmp, sizeof tmp);
+              std::deque<Message> messages;
+              {
+                auto mLock = std::scoped_lock(mqPtr->queueMutex);
+                messages.swap(mqPtr->messages);
+              }
+              while (!messages.empty()) {
+                const auto &msg = messages.front();
+                auto msgChannels = std::move(msg.channels);
+                switch (msg.command) {
+                  case Command::UNSUBSCRIBE: {
+                    msgChannels.insert(msgChannels.begin(), "UNSUBSCRIBE");
+                    std::println("UNSUB {}", msgChannels);
+                    (void)appendCommandArgv(ctx.get(), msgChannels);
+                    (void)flushPending(ctx.get());
+                    break;
+                  }
+
+                  case Command::PUNSUBSCRIBE: {
+                    msgChannels.insert(msgChannels.begin(), "PUNSUBSCRIBE");
+                    std::println("PUNSUB {}", msgChannels);
+                    (void)appendCommandArgv(ctx.get(), msgChannels);
+                    (void)flushPending(ctx.get());
+                    break;
+                  }
+
+                  case Command::UNSUBSCRIBEALL: {
+                    msgChannels.insert(msgChannels.begin(), "UNSUBSCRIBE");
+                    std::println("UNSUB ALL {}", msgChannels);
+                    (void)appendCommandArgv(ctx.get(), msgChannels);
+                    (void)flushPending(ctx.get());
+                    msgChannels.at(0) = "PUNSUBSCRIBE";
+                    std::println("PUNSUB ALL {}", msgChannels);
+                    (void)appendCommandArgv(ctx.get(), msgChannels);
+                    (void)flushPending(ctx.get());
+                    break;
+                  }
+
+                  case Command::TERMINATE: {
+                    std::println("TERMINATE");
+                    mqPtr->terminate.store(true, std::memory_order_release);
+                    done = true;
+                    break;
+                  }
+                }
+                messages.pop_front();
+              }
             }
+
+            if (done) break;
 
             // socket died: attempt to reccreate context with exponential backoff
             if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+              drain(pfds[0].fd);
               std::chrono::milliseconds backoff{100};
               auto maxRetries{8u};
               auto retries{0u};
@@ -307,19 +382,96 @@ namespace RedisCpp {
             }
           }
         }
-        std::println("EXIT THREAD");
-        (void)::close(eventFileDesc);
+        (void)::close(mqPtr->signalFileDesc);
         try {
           subPromise->set_value();
         } catch (...) {
         }
-      };
+      };  // end subscriber lambda
+
+      auto subHash = [this]() -> uint64_t {
+        uint64_t thash{0xcbf29ce484222325ULL};
+        uint64_t k = std::hash<uint64_t>{}(idGen());
+        thash ^= k + 0x9e3779b97f4a7c15ULL + (thash << 6) + (thash >> 2);
+        k = std::hash<uint64_t>{}(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+        return thash ^ (k + 0x9e3779b97f4a7c15ULL + (thash << 6) + (thash >> 2));
+      }();
 
       {
         auto subLock = std::scoped_lock(subscriberMutex);
-        subscriberVec.emplace_back(Subscriber{std::jthread(std::move(subscriber)), finished});
+        (void)subscriberMap.emplace(subHash, Subscriber{std::jthread(std::move(subscriber), subHash),
+                                                        finished, std::move(messageQueuePtr)});
+      }
+      return subHash;
+    }  // end subscribe()
+
+    template <typename... Args>
+    requires(sizeof...(Args) >= 1) [[nodiscard]] bool unsubscribe(Args &&...args) {
+      auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
+      constexpr std::size_t N = sizeof...(Args);
+      using argDecltype = decltype(argsTuple);
+
+      static_assert(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<0, argDecltype>>, uint64_t>,
+                    "unsubscribe: first argument must be uint64_t");
+      uint64_t subId{std::get<0>(argsTuple)};
+
+      auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>)->std::vector<std::string_view> {
+        static_assert(((std::convertible_to<std::decay_t<std::tuple_element_t<I + 1, argDecltype>>,
+                                            std::string_view>)&&...),
+                      "unsubscribe: channel args must be string_view-like");
+        static_assert(
+            (!(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<I + 1, argDecltype>>, std::string> &&
+               std::is_rvalue_reference_v<std::tuple_element_t<I + 1, argDecltype>>)&&...),
+            "unsubscribe: rvalue std::string not allowed (temporary, would dangle)");
+        return std::vector<std::string_view>{std::string_view{std::get<I + 1>(argsTuple)}...};
+      }
+      (std::make_index_sequence<N - 1>{});
+
+      auto [channels, patChannels] =
+          [this](
+              auto &channelVec) -> std::pair<std::vector<std::string_view>, std::vector<std::string_view>> {
+        std::vector<std::string_view> chans, patChans;
+        chans.reserve(channelVec.size() + 1);
+        patChans.reserve(channelVec.size() + 1);
+
+        for (auto &c : channelVec) {
+          auto &v = isSubscribePattern(c) ? patChans : chans;
+          v.emplace_back(c);
+        }
+        return std::make_pair(chans, patChans);
+      }(allChannels);
+
+      auto subscriberEntry = subscriberMap.find(subId);
+      if (subscriberEntry != subscriberMap.end()) {
+        auto &sub = subscriberEntry->second;
+        {
+          auto qLock = std::scoped_lock(sub.queuePtr->queueMutex);
+          if (channels.empty() && patChannels.empty()) {
+            sub.queuePtr->messages.push_back(Message{Command::UNSUBSCRIBEALL, {}});
+          }
+          if (!channels.empty()) {
+            sub.queuePtr->messages.push_back(Message{Command::UNSUBSCRIBE, std::move(channels)});
+          }
+          if (!patChannels.empty()) {
+            sub.queuePtr->messages.push_back(Message{Command::PUNSUBSCRIBE, std::move(patChannels)});
+          }
+        }
+        sub.queuePtr->wakeup();
       }
       return true;
+    }  // end unsubscribe
+
+    void stop(uint64_t subId) {
+      auto subscriberEntry = subscriberMap.find(subId);
+
+      if (subscriberEntry != subscriberMap.end()) {
+        auto &sub = subscriberEntry->second;
+        {
+          auto qLock = std::scoped_lock(sub.queuePtr->queueMutex);
+          sub.queuePtr->messages.push_back(Message{Command::TERMINATE, {}});
+        }
+        sub.queuePtr->wakeup();
+      }
     }
 
    private:
@@ -329,6 +481,9 @@ namespace RedisCpp {
     ListenerMap listeners;
     mutable std::mutex subscriberMutex;
     SubscriberVec subscriberVec;
+    SubscriberMap subscriberMap;
+    IdGenerator idGen;
+    std::jthread reaperThread;
 
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(redisContext *ctx, const char *format, Args &&...args) {
@@ -474,14 +629,43 @@ namespace RedisCpp {
 
     void reapSubscribers() {
       auto subLock = std::scoped_lock(subscriberMutex);
-      std::erase_if(subscriberVec, [](Subscriber &sub) {
+      std::erase_if(subscriberMap, [](auto &subscriberEntry) {
+        auto &[id, sub] = subscriberEntry;
         if (sub.finished.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
           if (sub.subThread.joinable()) sub.subThread.join();
-          std::println("REAP TRUE");
           return true;  // erase
         }
-        std::println("REAP FALSE");
-        return false;  // keep
+        return false;
+      });
+    }
+
+    void startReaper() {
+      const auto period = 2s;
+      reaperThread = std::jthread([this, period](std::stop_token tok) {
+        std::mutex reaperMutex;
+        std::condition_variable timerVar;
+        bool stop = false;
+
+        std::stop_callback stopReaper(tok, [&] {
+          auto reapLock = std::scoped_lock(reaperMutex);
+          stop = true;
+          timerVar.notify_all();
+        });
+
+        auto next = std::chrono::steady_clock::now() + period;
+
+        while (true) {
+          auto waitLock = std::unique_lock(reaperMutex);
+          // Wake on stop or at the next tick
+          if (timerVar.wait_until(waitLock, next, [&] { return stop; })) break;  // stopped
+          waitLock.unlock();
+
+          reapSubscribers();
+
+          do {
+            next += period;
+          } while (next <= std::chrono::steady_clock::now());
+        }
       });
     }
 

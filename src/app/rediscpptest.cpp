@@ -45,13 +45,44 @@ int main() {
   //   std::println("ASYNC OPTGET {}", newget.value());
   // }
 
+  auto newget = client.get("foox");
+  if (newget.has_value()) {
+    std::println("ASYNC OPTGET {}", newget.value());
+  }
+
   SubscriptionHandler sh("thing1"), sh2("thing2");
 
-  client.subscribe("testch", "channel2", "wildcard*", sh);
-  client.subscribe("also", sh2);
+  auto suba = client.subscribe("testch", "channel2", "wildcard*", sh);
+  auto subb = client.subscribe("also", sh2);
 
+  std::println("SUBA: {:016X}\nSUBB: {:016X}", suba, subb);
   auto ix = 0;
-  while (ix++ < 40) {
+  while (ix++ < 5) {
+    std::this_thread::sleep_for(100ms);
+  }
+
+  // (void)client.unsubscribe(suba, "channel2", "wildcard*");
+  (void)client.unsubscribe(suba, "channel2");
+  // (void)client.unsubscribe(suba);
+
+  ix = 0;
+  while (ix++ < 10) {
+    std::this_thread::sleep_for(1s);
+  }
+
+  client.stop(suba);
+
+  ix = 0;
+  while (ix++ < 7) {
+    std::this_thread::sleep_for(1s);
+  }
+
+  auto subc = client.subscribe("newch", sh2);
+
+  std::println("SUBC: {:016X}", subc);
+
+  ix = 0;
+  while (ix++ < 15) {
     std::this_thread::sleep_for(1s);
   }
 
