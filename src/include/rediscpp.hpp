@@ -91,7 +91,6 @@ namespace RedisCpp {
   using ReplyPointer = std::unique_ptr<redisReply, ReplyDeleter>;
   using ContextPointer = std::unique_ptr<redisContext, ContextDeleter>;
   using SubscriberCallback = std::function<void(std::span<std::string_view>)>;
-  using SubscriberVec = std::vector<Subscriber>;
   using SubscriberMap = std::unordered_map<uint64_t, Subscriber>;
   using IdGenerator = RandomInt::RandomUint64Generator;
 
@@ -480,7 +479,6 @@ namespace RedisCpp {
     mutable std::mutex listenerMutex;
     ListenerMap listeners;
     mutable std::mutex subscriberMutex;
-    SubscriberVec subscriberVec;
     SubscriberMap subscriberMap;
     IdGenerator idGen;
     std::jthread reaperThread;
