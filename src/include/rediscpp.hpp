@@ -71,7 +71,7 @@ namespace RedisCpp {
       (void)::read(signalFileDesc, &tmp, sizeof(tmp));
     }
     void wakeup() {
-      uint64_t one = 1;
+      uint64_t one{1};
       (void)::write(signalFileDesc, &one, sizeof(one));
     }
     int signalFileDesc{-1};
@@ -214,7 +214,7 @@ namespace RedisCpp {
     template <typename... Args>
     requires(sizeof...(Args) >= 2) [[nodiscard]] uint64_t subscribe(Args &&...args) {
       auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
-      constexpr std::size_t N = sizeof...(Args);
+      constexpr std::size_t N{sizeof...(Args)};
       using argDecltype = decltype(argsTuple);
 
       using CallbackArg = std::tuple_element_t<N - 1, argDecltype>;
@@ -407,7 +407,7 @@ namespace RedisCpp {
     template <typename... Args>
     requires(sizeof...(Args) >= 1) [[nodiscard]] bool unsubscribe(Args &&...args) {
       auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
-      constexpr std::size_t N = sizeof...(Args);
+      constexpr std::size_t N{sizeof...(Args)};
       using argDecltype = decltype(argsTuple);
 
       static_assert(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<0, argDecltype>>, uint64_t>,
@@ -534,7 +534,7 @@ namespace RedisCpp {
     }
 
     inline bool flushPending(redisContext *ctx) {
-      int done = 0;
+      int done{0};
       while (!done) {
         auto rc = ::redisBufferWrite(ctx, &done);
         if (rc == REDIS_ERR) return false;
@@ -592,7 +592,7 @@ namespace RedisCpp {
     }
 
     void handleSubscriptionMessage(redisContext *ctx, SubscriberCallback &&handler) {
-      void *reply = nullptr;
+      void *reply{nullptr};
       if (::redisGetReply(ctx, &reply) == REDIS_OK) {
         auto replyPtr = ReplyPointer(static_cast<redisReply *>(reply));
         auto elements = extractMessageElements(replyPtr);
@@ -601,7 +601,7 @@ namespace RedisCpp {
 
       // drain any further messages
       for (;;) {
-        void *reply = nullptr;
+        reply = nullptr;
         int rc = redisGetReplyFromReader(ctx, &reply);
         if (rc == REDIS_ERR || reply == nullptr) break;
 
