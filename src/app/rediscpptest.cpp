@@ -40,16 +40,39 @@ int main() {
   // auto added = client.addListener("testq", qh);
   // std::println("ADDED {}", added);
 
-  // auto newget = client.get("foox");
-  // if (newget.has_value()) {
-  //   std::println("ASYNC OPTGET {}", newget.value());
-  // }
-
-  auto newget = client.get("foox");
-  if (newget.has_value()) {
-    std::println("ASYNC OPTGET {}", newget.value());
+  auto get = client.get("foox");
+  if (get.has_value()) {
+    std::println("ASYNC OPTGET {}", get.value());
   }
 
+  auto set = client.set("foox", "a foo value", "XX");
+
+  get = client.get("foox");
+  if (get.has_value()) {
+    std::println("ASYNC OPTGET {}", get.value());
+  }
+
+  auto hset = client.hset("foohash", "foo", "bar", "wtf", "nah");
+
+  auto hvec = client.hgetall("foohash");
+  if (hvec.has_value()) {
+    std::println("HVEC SZ {} {}", hvec.value().size(), hvec.value());
+  }
+
+  auto foo = client.hget("foohash", "foo");
+  if (foo.has_value()) {
+    std::println("HGET {}", foo.value());
+  }
+
+  auto del = client.hdel("foohash", "baz");
+  std::println("DET TP {}", del);
+
+  hvec = client.hgetall("foohash");
+  if (hvec.has_value()) {
+    std::println("HVEC SZ {} {}", hvec.value().size(), hvec.value());
+  }
+
+#if 0
   SubscriptionHandler sh("thing1"), sh2("thing2");
 
   auto suba = client.subscribe("testch", "channel2", "wildcard*", sh);
@@ -85,9 +108,10 @@ int main() {
   while (ix++ < 15) {
     std::this_thread::sleep_for(1s);
   }
+#endif
 
-  /* while (true) {
+  while (true) {
     std::this_thread::sleep_for(1s);
-  } */
+  }
   return 0;
 }

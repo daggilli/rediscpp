@@ -33,6 +33,15 @@
 #include <utility>
 #include <vector>
 
+// C++26 introduced a constructor for std::span from an initializer_list
+// If we don't have it, enable some shim overloads
+#if defined(__cpp_lib_span_initializer_list) && __cpp_lib_span_initializer_list >= 202311L
+#define HAS_SPAN_INIT_LIST_CTOR 1
+#else
+#define HAS_SPAN_INIT_LIST_CTOR 0
+#include <initializer_list>
+#endif
+
 #include "redisconfig.hpp"
 
 using namespace std::string_literals;
@@ -93,11 +102,15 @@ namespace RedisCpp {
   using SubscriberCallback = std::function<void(std::span<std::string_view>)>;
   using SubscriberMap = std::unordered_map<uint64_t, Subscriber>;
   using IdGenerator = RandomInt::RandomUint64Generator;
+  using HmapEntry = std::pair<std::string, std::string>;
+  using HmapVec = std::vector<HmapEntry>;
 
-  // ensure arguments are string_view or can construct a string_view implicitly. Do not allow
-  // rvalue refs (temporaries) because they will dangle
+  // ensure arguments are string_view or can construct a string_view
+  // implicitly. Do not allow rvalue refs (temporaries) because they
+  // will dangle
   template <typename T>
-  concept satisfies_stringview = std::constructible_from<std::string_view, T> &&
+  concept satisfies_stringview =
+      std::constructible_from<std::string_view, T> &&
       !(std::same_as<std::remove_cvref_t<T>, std::string> && std::is_rvalue_reference_v<T &&>);
 
   class Client {
@@ -151,35 +164,104 @@ namespace RedisCpp {
       return replyPtr;
     }
 
-    [[nodiscard]] std::optional<std::string> get(const std::string_view key) {
+#if !HAS_SPAN_INIT_LIST_CTOR
+    [[nodiscard]] inline ReplyPointer commandArgv(std::initializer_list<std::string_view> args) {
+      return commandArgv(std::span<const std::string_view>(args.begin(), args.size()));
+    }
+#endif
+
+    [[nodiscard]] std::optional<std::string> get(const std::string_view &key) {
       auto getReply = commandArgv({"GET", key});
       if (replyOk(context.get(), getReply, REDIS_REPLY_STRING)) {
-        return std::optional<std::string>(getReply->str);
+        return getReply->str;
       }
 
       return std::nullopt;
     }
 
-    template <typename... Args>
-    [[nodiscard]] inline ReplyPointer set(const char *const key, const char *const value, Args &&...args) {
+    template <satisfies_stringview... Args>
+    [[nodiscard]] inline ReplyPointer set(const std::string_view key, const std::string_view &value,
+                                          Args &&...args) {
       auto argv = std::vector<std::string_view>{"SET", key, value};
       gatherArgs(argv, std::forward<Args>(args)...);
       return commandArgv(argv);
     }
 
-    [[nodiscard]] inline ReplyPointer publish(const char *const channel, const char *const message) {
-      return commandArgv({"PUBLISH", channel, message});
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
+    [[nodiscard]] inline ReplyPointer hset(const std::string_view key, Args &&...args) {
+      constexpr size_t N = 2 + sizeof...(Args);
+      std::array<std::string_view, N> argv{"HSET", key, std::string_view(std::forward<Args>(args))...};
+      return commandArgv(argv);
     }
 
-    [[nodiscard]] std::vector<std::string> vectoriseReply(ReplyPointer const &reply) {
-      std::vector<std::string> replyVec{};
-      if (reply->type == REDIS_REPLY_ARRAY) {
-        replyVec.reserve(reply->elements);
-        for (auto i{0u}; i < reply->elements; i++) {
-          replyVec.emplace_back(reply->element[i]->str);
-        }
+    [[nodiscard]] inline std::optional<std::string> hget(const std::string_view key,
+                                                         const std::string_view field) {
+      auto argv = std::vector<std::string_view>{"HGET", key, field};
+      auto replyPtr = commandArgv(argv);
+      if (replyPtr->type == REDIS_REPLY_NIL) return std::nullopt;
+      return replyPtr->str;
+    }
+
+    [[nodiscard]] inline std::optional<HmapVec> hgetall(const std::string_view key) {
+      auto argv = std::vector<std::string_view>{"HGETALL", key};
+      auto replyPtr = commandArgv(argv);
+      if (!statusReplyArrayLikeOk(context.get(), replyPtr)) {
+        throw std::runtime_error(std::format("commandArgv failed: {}", context->err));
       }
-      return replyVec;
+      if (replyPtr->elements == 0) return std::nullopt;
+
+      HmapVec hashVector;
+      hashVector.reserve(replyPtr->elements / 2);
+      for (auto i{0u}; i < replyPtr->elements; i += 2) {
+        hashVector.emplace_back(replyPtr->element[i]->str, replyPtr->element[i + 1]->str);
+      }
+      return hashVector;
+    }
+
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) >= 1)
+    [[nodiscard]] inline int hdel(const std::string_view key, Args &&...args) {
+      constexpr size_t N = 2 + sizeof...(Args);
+      std::array<std::string_view, N> argv{"HDEL", key, std::string_view(std::forward<Args>(args))...};
+      auto replyPtr = commandArgv(argv);
+      return replyPtr->integer;
+    }
+
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
+    [[nodiscard]] inline ReplyPointer sadd(const std::string_view key, Args &&...args) {
+      constexpr size_t N = 2 + sizeof...(Args);
+      std::array<std::string_view, N> argv{"SADD", key, std::string_view(std::forward<Args>(args))...};
+      return commandArgv(argv);
+    }
+
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
+    [[nodiscard]] inline ReplyPointer srem(const std::string_view key, Args &&...args) {
+      constexpr size_t N = 2 + sizeof...(Args);
+      std::array<std::string_view, N> argv{"SREM", key, std::string_view(std::forward<Args>(args))...};
+      return commandArgv(argv);
+    }
+
+    [[nodiscard]] inline std::optional<std::vector<std::string>> smembers(const std::string_view key) {
+      auto argv = std::vector<std::string_view>{"SMEMBERS", key};
+      auto replyPtr = commandArgv(argv);
+      if (!statusReplyArrayLikeOk(context.get(), replyPtr)) {
+        throw std::runtime_error(std::format("commandArgv failed: {}", context->err));
+      }
+      if (replyPtr->elements == 0) return std::nullopt;
+
+      std::vector<std::string> setVector;
+      setVector.reserve(replyPtr->elements);
+      for (auto i{0u}; i < replyPtr->elements; i++) {
+        setVector.emplace_back(replyPtr->element[i]->str);
+      }
+      return setVector;
+    }
+
+    [[nodiscard]] inline ReplyPointer publish(const char *const channel, const char *const message) {
+      return commandArgv({"PUBLISH", channel, message});
     }
 
     bool addListener(const std::string queueName, Callback cb) {
@@ -212,7 +294,8 @@ namespace RedisCpp {
     }
 
     template <typename... Args>
-    requires(sizeof...(Args) >= 2) [[nodiscard]] uint64_t subscribe(Args &&...args) {
+      requires(sizeof...(Args) >= 2)
+    [[nodiscard]] uint64_t subscribe(Args &&...args) {
       auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
       constexpr std::size_t N{sizeof...(Args)};
       using argDecltype = decltype(argsTuple);
@@ -222,17 +305,18 @@ namespace RedisCpp {
                     "subscribe: last argument must be a callable convertible to SubscriberCallback");
       SubscriberCallback cb{std::get<N - 1>(argsTuple)};
 
-      auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>)->std::vector<std::string_view> {
-        static_assert(((std::convertible_to<std::decay_t<std::tuple_element_t<I, argDecltype>>,
-                                            std::string_view>)&&...),
-                      "subscribe: channel args must be string_view-like");
+      auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>) -> std::vector<std::string_view> {
+        static_assert(
+            ((std::convertible_to<std::decay_t<std::tuple_element_t<I, argDecltype>>, std::string_view>) &&
+             ...),
+            "subscribe: channel args must be string_view-like");
         static_assert(
             (!(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<I, argDecltype>>, std::string> &&
-               std::is_rvalue_reference_v<std::tuple_element_t<I, argDecltype>>)&&...),
+               std::is_rvalue_reference_v<std::tuple_element_t<I, argDecltype>>) &&
+             ...),
             "subscribe: rvalue std::string not allowed (temporary, would dangle)");
         return std::vector<std::string_view>{std::string_view{std::get<I>(argsTuple)}...};
-      }
-      (std::make_index_sequence<N - 1>{});
+      }(std::make_index_sequence<N - 1>{});
 
       auto [channels, patChannels] =
           [this](
@@ -405,7 +489,8 @@ namespace RedisCpp {
     }  // end subscribe()
 
     template <typename... Args>
-    requires(sizeof...(Args) >= 1) [[nodiscard]] bool unsubscribe(Args &&...args) {
+      requires(sizeof...(Args) >= 1)
+    [[nodiscard]] bool unsubscribe(Args &&...args) {
       auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
       constexpr std::size_t N{sizeof...(Args)};
       using argDecltype = decltype(argsTuple);
@@ -414,17 +499,19 @@ namespace RedisCpp {
                     "unsubscribe: first argument must be uint64_t");
       uint64_t subId{std::get<0>(argsTuple)};
 
-      auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>)->std::vector<std::string_view> {
+      auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>) -> std::vector<std::string_view> {
         static_assert(((std::convertible_to<std::decay_t<std::tuple_element_t<I + 1, argDecltype>>,
-                                            std::string_view>)&&...),
+                                            std::string_view>) &&
+                       ...),
                       "unsubscribe: channel args must be string_view-like");
         static_assert(
             (!(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<I + 1, argDecltype>>, std::string> &&
-               std::is_rvalue_reference_v<std::tuple_element_t<I + 1, argDecltype>>)&&...),
-            "unsubscribe: rvalue std::string not allowed (temporary, would dangle)");
+               std::is_rvalue_reference_v<std::tuple_element_t<I + 1, argDecltype>>) &&
+             ...),
+            "unsubscribe: rvalue std::string not allowed (temporary, "
+            "would dangle)");
         return std::vector<std::string_view>{std::string_view{std::get<I + 1>(argsTuple)}...};
-      }
-      (std::make_index_sequence<N - 1>{});
+      }(std::make_index_sequence<N - 1>{});
 
       auto [channels, patChannels] =
           [this](
@@ -510,6 +597,13 @@ namespace RedisCpp {
       return replyPtr;
     }
 
+#if !HAS_SPAN_INIT_LIST_CTOR
+    [[nodiscard]] inline ReplyPointer commandArgv(redisContext *ctx,
+                                                  std::initializer_list<const std::string_view> args) {
+      return commandArgv(ctx, std::span<const std::string_view>(args.begin(), args.size()));
+    }
+#endif
+
     inline int appendCommandArgv(redisContext *ctx, std::span<const std::string_view> args) {
       if (args.empty()) return 0;
       std::vector<const char *> argv;
@@ -545,7 +639,6 @@ namespace RedisCpp {
     [[nodiscard]] inline ReplyPointer getReply(redisContext *ctx) {
       redisReply *reply;
       auto result = ::redisGetReply(ctx, std::bit_cast<void **>(&reply));
-      std::println("RESULT {}", result);
       if (result != REDIS_OK) {
         if (ctx->err && ctx->err != REDIS_ERR_IO) {
           throw std::runtime_error(
@@ -680,9 +773,10 @@ namespace RedisCpp {
               replyPtr->len == 2 && !std::strncmp(replyPtr->str, "OK", 2));
     }
 
-    inline bool statusReplyMapOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
-      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_MAP &&
-              replyPtr->len % 2 == 0 && !std::strncmp(replyPtr->str, "OK", 2));
+    inline bool statusReplyArrayLikeOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err &&
+              (replyPtr->type == REDIS_REPLY_MAP || replyPtr->type == REDIS_REPLY_ARRAY) &&
+              (replyPtr->type == REDIS_REPLY_MAP ? replyPtr->len % 2 == 0 : true));
     }
 
     inline bool subscribeReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
@@ -716,7 +810,7 @@ namespace RedisCpp {
 
     static inline void setSignals() {
       std::call_once(sigSetup, [] {
-        struct sigaction sigAct {};
+        struct sigaction sigAct{};
         sigAct.sa_flags = 0;
         sigemptyset(&sigAct.sa_mask);
         sigAct.sa_handler = SIG_IGN;
