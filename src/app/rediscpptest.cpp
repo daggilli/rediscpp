@@ -36,9 +36,14 @@ int main() {
 
   // auto pub = client.publish("testch", "a message");
 
-  // QueueHandler qh;
-  // auto added = client.addListener("testq", qh);
-  // std::println("ADDED {}", added);
+  QueueHandler qh;
+  auto added = client.addListener("testq", qh);
+  std::println("ADDED {}", added);
+
+  for (auto i{0u}; i < 5; i++) {
+    (void)client.rpush("testq", std::string_view(std::format("QITEM {}", i)));
+    // std::this_thread::sleep_for(1ms);
+  }
 
   auto get = client.get("foox");
   if (get.has_value()) {
@@ -72,6 +77,11 @@ int main() {
     std::println("HVEC SZ {} {}", hvec.value().size(), hvec.value());
   }
 
+  auto sadd = client.sadd("fooset", "foo", "bar", "baz");
+
+  auto sism = client.sismember("fooset", "barr");
+
+  std::println("SISM {}", sism);
 #if 0
   SubscriptionHandler sh("thing1"), sh2("thing2");
 

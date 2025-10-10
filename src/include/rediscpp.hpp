@@ -182,8 +182,17 @@ namespace RedisCpp {
     template <satisfies_stringview... Args>
     [[nodiscard]] inline ReplyPointer set(const std::string_view key, const std::string_view &value,
                                           Args &&...args) {
-      auto argv = std::vector<std::string_view>{"SET", key, value};
-      gatherArgs(argv, std::forward<Args>(args)...);
+      constexpr size_t N = 3 + sizeof...(Args);
+      auto argv =
+          std::array<std::string_view, N>{"SET", key, value, std::string_view(std::forward<Args>(args))...};
+      return commandArgv(argv);
+    }
+
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) >= 2)
+    [[nodiscard]] inline ReplyPointer del(const std::string_view key, Args &&...args) {
+      constexpr size_t N = 1 + sizeof...(Args);
+      auto argv = std::array<std::string_view, N>{"DEL", std::string_view(std::forward<Args>(args))...};
       return commandArgv(argv);
     }
 
@@ -191,20 +200,20 @@ namespace RedisCpp {
       requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
     [[nodiscard]] inline ReplyPointer hset(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
-      std::array<std::string_view, N> argv{"HSET", key, std::string_view(std::forward<Args>(args))...};
+      auto argv = std::array<std::string_view, N>{"HSET", key, std::string_view(std::forward<Args>(args))...};
       return commandArgv(argv);
     }
 
     [[nodiscard]] inline std::optional<std::string> hget(const std::string_view key,
                                                          const std::string_view field) {
-      auto argv = std::vector<std::string_view>{"HGET", key, field};
+      auto argv = std::array<std::string_view, 3>{"HGET", key, field};
       auto replyPtr = commandArgv(argv);
       if (replyPtr->type == REDIS_REPLY_NIL) return std::nullopt;
       return replyPtr->str;
     }
 
     [[nodiscard]] inline std::optional<HmapVec> hgetall(const std::string_view key) {
-      auto argv = std::vector<std::string_view>{"HGETALL", key};
+      auto argv = std::array<std::string_view, 2>{"HGETALL", key};
       auto replyPtr = commandArgv(argv);
       if (!statusReplyArrayLikeOk(context.get(), replyPtr)) {
         throw std::runtime_error(std::format("commandArgv failed: {}", context->err));
@@ -223,32 +232,32 @@ namespace RedisCpp {
       requires(sizeof...(Args) >= 1)
     [[nodiscard]] inline int hdel(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
-      std::array<std::string_view, N> argv{"HDEL", key, std::string_view(std::forward<Args>(args))...};
+      auto argv = std::array<std::string_view, N>{"HDEL", key, std::string_view(std::forward<Args>(args))...};
       auto replyPtr = commandArgv(argv);
       return replyPtr->integer;
     }
 
     template <satisfies_stringview... Args>
-      requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
+      requires(sizeof...(Args) >= 2)
     [[nodiscard]] inline ReplyPointer sadd(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
-      std::array<std::string_view, N> argv{"SADD", key, std::string_view(std::forward<Args>(args))...};
+      auto argv = std::array<std::string_view, N>{"SADD", key, std::string_view(std::forward<Args>(args))...};
       return commandArgv(argv);
     }
 
     template <satisfies_stringview... Args>
-      requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
+      requires(sizeof...(Args) >= 2)
     [[nodiscard]] inline ReplyPointer srem(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
-      std::array<std::string_view, N> argv{"SREM", key, std::string_view(std::forward<Args>(args))...};
+      auto argv = std::array<std::string_view, N>{"SREM", key, std::string_view(std::forward<Args>(args))...};
       return commandArgv(argv);
     }
 
     [[nodiscard]] inline std::optional<std::vector<std::string>> smembers(const std::string_view key) {
-      auto argv = std::vector<std::string_view>{"SMEMBERS", key};
+      auto argv = std::array<std::string_view, 2>{"SMEMBERS", key};
       auto replyPtr = commandArgv(argv);
       if (!statusReplyArrayLikeOk(context.get(), replyPtr)) {
-        throw std::runtime_error(std::format("commandArgv failed: {}", context->err));
+        throw std::runtime_error(std::format("SMEMBERS failed: {}", context->err));
       }
       if (replyPtr->elements == 0) return std::nullopt;
 
@@ -260,7 +269,29 @@ namespace RedisCpp {
       return setVector;
     }
 
-    [[nodiscard]] inline ReplyPointer publish(const char *const channel, const char *const message) {
+    [[nodiscard]] inline bool sismember(const std::string_view key, const std::string_view member) {
+      auto argv = std::array<std::string_view, 3>{"SISMEMBER", key, member};
+      auto replyPtr = commandArgv(argv);
+      if (!intReplyOk(context.get(), replyPtr)) {
+        throw std::runtime_error(std::format("SISMEMBER failed: {}", context->err));
+      }
+      return static_cast<bool>(replyPtr->integer);
+    }
+
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) > 0)
+    [[nodiscard]] inline ReplyPointer rpush(const std::string_view key, Args &&...args) {
+      return push("RPUSH", key, std::forward<Args>(args)...);
+    }
+
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) > 0)
+    [[nodiscard]] inline ReplyPointer lpush(const std::string_view key, Args &&...args) {
+      return push("LPUSH", key, std::forward<Args>(args)...);
+    }
+
+    [[nodiscard]] inline ReplyPointer publish(const std::string_view channel,
+                                              const std::string_view message) {
       return commandArgv({"PUBLISH", channel, message});
     }
 
@@ -275,8 +306,8 @@ namespace RedisCpp {
         while (!tok.stop_requested()) {
           auto replyPtr = commandArgv(ctx.get(), {"BLPOP", qn, blockingTimeoutSecs});
           if (!tok.stop_requested() && bpopReplyOk(context.get(), replyPtr)) {
-            auto item = std::make_tuple(std::string_view{replyPtr->element[0]->str},
-                                        std::string_view{replyPtr->element[1]->str});
+            auto item = std::make_pair(std::string_view{replyPtr->element[0]->str},
+                                       std::string_view{replyPtr->element[1]->str});
             std::apply(handler, item);
           }
         }
@@ -545,7 +576,7 @@ namespace RedisCpp {
         sub.queuePtr->wakeup();
       }
       return true;
-    }  // end unsubscribe
+    }  // end unsubscribe()
 
     void stop(uint64_t subId) {
       auto subscriberEntry = subscriberMap.find(subId);
@@ -684,6 +715,16 @@ namespace RedisCpp {
       return ContextPointer(ctx);
     }
 
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) > 0)
+    [[nodiscard]] inline ReplyPointer push(const std::string_view dir, const std::string_view key,
+                                           Args &&...args) {
+      constexpr size_t N = 2 + sizeof...(Args);
+      auto argv = std::array<std::string_view, N>{dir, key, std::string_view(std::forward<Args>(args))...};
+      std::println("LPUSH: {}", argv);
+      return commandArgv(argv);
+    }
+
     void handleSubscriptionMessage(redisContext *ctx, SubscriberCallback &&handler) {
       void *reply{nullptr};
       if (::redisGetReply(ctx, &reply) == REDIS_OK) {
@@ -693,7 +734,7 @@ namespace RedisCpp {
       }
 
       // drain any further messages
-      for (;;) {
+      while (true) {
         reply = nullptr;
         int rc = redisGetReplyFromReader(ctx, &reply);
         if (rc == REDIS_ERR || reply == nullptr) break;
@@ -768,6 +809,10 @@ namespace RedisCpp {
       return (replyPtr != nullptr && !ctx->err && replyPtr->type == expectedType);
     }
 
+    inline bool intReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_INTEGER);
+    }
+
     inline bool statusReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
       return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_STATUS &&
               replyPtr->len == 2 && !std::strncmp(replyPtr->str, "OK", 2));
@@ -784,15 +829,9 @@ namespace RedisCpp {
               replyPtr->elements == 3);
     }
 
-    inline bool bpopReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) {
+    inline bool bpopReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
       return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_ARRAY &&
               replyPtr->elements == 2);
-    }
-
-    template <satisfies_stringview... Args>
-    void gatherArgs(std::vector<std::string_view> &onto, Args &&...args) {
-      onto.reserve(onto.size() + sizeof...(Args));
-      (onto.emplace_back(args), ...);
     }
 
     bool isSubscribePattern(const std::string_view &str) {
