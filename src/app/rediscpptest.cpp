@@ -30,10 +30,11 @@ struct SubscriptionHandler {
   std::string name;
 };
 
-int main() {
+int main(int argc, char* argv[]) {
   RedisCpp::Config cfg("config/redisconfig.json");
   auto client = RedisCpp::Client(cfg);
 
+#if 0
   // auto pub = client.publish("testch", "a message");
 
   QueueHandler qh;
@@ -80,34 +81,49 @@ int main() {
   auto sadd = client.sadd("fooset", "foo", "bar", "baz");
 
   auto sism = client.sismember("fooset", "barr");
-
+  
   std::println("SISM {}", sism);
-#if 0
+#endif
+
+#if 1
   SubscriptionHandler sh("thing1"), sh2("thing2");
 
   auto suba = client.subscribe("testch", "channel2", "wildcard*", sh);
-  auto subb = client.subscribe("also", sh2);
+  // auto subb = client.subscribe("also", sh2);
 
-  std::println("SUBA: {:016X}\nSUBB: {:016X}", suba, subb);
-  auto ix = 0;
-  while (ix++ < 5) {
-    std::this_thread::sleep_for(100ms);
+  // std::println("SUBA: {:016X}\nSUBB: {:016X}", suba, subb);
+  // auto ix = 0;
+  // while (ix++ < 10) {
+  //   std::this_thread::sleep_for(100ms);
+  // }
+
+  auto ix{0u};
+  if (argc > 1) {
+    while (ix++ < 10) {
+      std::this_thread::sleep_for(100ms);
+    }
   }
 
   // (void)client.unsubscribe(suba, "channel2", "wildcard*");
   (void)client.unsubscribe(suba, "channel2");
   // (void)client.unsubscribe(suba);
+  // std::this_thread::sleep_for(100ms);
 
+  auto added = client.subscribe(suba, "bingchilling", "foobar*");
+  std::println("ADDED {}", added);
+#endif
+
+#if 0
   ix = 0;
-  while (ix++ < 10) {
-    std::this_thread::sleep_for(1s);
+  while (ix++ < 3) {
+    std::this_thread::sleep_for(100ms);
   }
 
   client.stop(suba);
 
   ix = 0;
-  while (ix++ < 7) {
-    std::this_thread::sleep_for(1s);
+  while (ix++ < 4) {
+    std::this_thread::sleep_for(100ms);
   }
 
   auto subc = client.subscribe("newch", sh2);
@@ -115,9 +131,12 @@ int main() {
   std::println("SUBC: {:016X}", subc);
 
   ix = 0;
-  while (ix++ < 15) {
-    std::this_thread::sleep_for(1s);
+  while (ix++ < 6) {
+    std::this_thread::sleep_for(100ms);
   }
+
+  auto added = client.subscribe(suba, "bingchilling", "foobar*");
+  std::println("ADDED {}", added);
 #endif
 
   while (true) {

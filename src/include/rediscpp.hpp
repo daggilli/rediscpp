@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <concepts>
+#include <condition_variable>
 #include <csignal>
 #include <cstring>
 #include <deque>
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -62,12 +64,11 @@ namespace RedisCpp {
 
   struct ContextDeleter {
     void operator()(redisContext *ctx) const noexcept {
-      std::println("CONTEXTDELETER");
       if (ctx) ::redisFree(ctx);
     }
   };
 
-  enum class Command { UNSUBSCRIBE, PUNSUBSCRIBE, UNSUBSCRIBEALL, TERMINATE };
+  enum class Command { SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, UNSUBSCRIBEALL, TERMINATE };
 
   struct Message {
     Command command;
@@ -93,6 +94,7 @@ namespace RedisCpp {
     std::jthread subThread;
     std::shared_future<void> finished;
     std::shared_ptr<MessageQueue> queuePtr;
+    std::latch ready{1};
   };
 
   using ListenerMap = std::unordered_map<std::string, std::jthread>;
@@ -124,7 +126,6 @@ namespace RedisCpp {
     Client(const Client &cli) = delete;
     Client(Client &&cli) : config{std::move(cli.config)}, context{std::exchange(cli.context, nullptr)} {}
     virtual ~Client() {
-      std::println("REDISCLIENT DTOR");
       for (auto &[name, lthread] : listeners) {
         lthread.request_stop();
       }
@@ -324,6 +325,10 @@ namespace RedisCpp {
       return listeners.erase(queueName) > 0;
     }
 
+    /**
+     * SUBSCIRBE
+     * (channels..., callback) overload
+     */
     template <typename... Args>
       requires(sizeof...(Args) >= 2)
     [[nodiscard]] uint64_t subscribe(Args &&...args) {
@@ -372,7 +377,7 @@ namespace RedisCpp {
 
       auto subscriber = [this, chans = std::move(channels), patChans = std::move(patChannels),
                          handler = std::move(cb), subPromise,
-                         mqPtr = messageQueuePtr](std::stop_token tok, uint64_t id) mutable {
+                         mqPtr = messageQueuePtr](std::stop_token tok, Subscriber &sub) mutable {
         auto ctx = connectAndSubscribe(config, chans, patChans);
 
         auto contextFileDesc = ctx->fd;
@@ -399,6 +404,8 @@ namespace RedisCpp {
             (void)::read(fd, &tmp, sizeof tmp);
           };
 
+          sub.ready.count_down();
+
           while (!done) {
             if (mqPtr->terminate.load(std::memory_order_acquire)) {
               done = true;
@@ -417,8 +424,6 @@ namespace RedisCpp {
 
             if (pfds[1].revents & POLLIN) {
               mqPtr->drain();
-              uint64_t tmp;
-              (void)::read(mqPtr->signalFileDesc, &tmp, sizeof tmp);
               std::deque<Message> messages;
               {
                 auto mLock = std::scoped_lock(mqPtr->queueMutex);
@@ -428,9 +433,23 @@ namespace RedisCpp {
                 const auto &msg = messages.front();
                 auto msgChannels = std::move(msg.channels);
                 switch (msg.command) {
+                  case Command::SUBSCRIBE: {
+                    msgChannels.insert(msgChannels.begin(), "SUBSCRIBE");
+                    // std::println("ADD SUB {}", msgChannels);
+                    (void)appendCommandArgv(ctx.get(), msgChannels);
+                    (void)flushPending(ctx.get());
+                    break;
+                  }
+                  case Command::PSUBSCRIBE: {
+                    msgChannels.insert(msgChannels.begin(), "PSUBSCRIBE");
+                    // std::println("ADD PSUB {}", msgChannels);
+                    (void)appendCommandArgv(ctx.get(), msgChannels);
+                    (void)flushPending(ctx.get());
+                    break;
+                  }
                   case Command::UNSUBSCRIBE: {
                     msgChannels.insert(msgChannels.begin(), "UNSUBSCRIBE");
-                    std::println("UNSUB {}", msgChannels);
+                    // std::println("UNSUB {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
@@ -438,7 +457,7 @@ namespace RedisCpp {
 
                   case Command::PUNSUBSCRIBE: {
                     msgChannels.insert(msgChannels.begin(), "PUNSUBSCRIBE");
-                    std::println("PUNSUB {}", msgChannels);
+                    // std::println("PUNSUB {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
@@ -446,18 +465,18 @@ namespace RedisCpp {
 
                   case Command::UNSUBSCRIBEALL: {
                     msgChannels.insert(msgChannels.begin(), "UNSUBSCRIBE");
-                    std::println("UNSUB ALL {}", msgChannels);
+                    // std::println("UNSUB ALL {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     msgChannels.at(0) = "PUNSUBSCRIBE";
-                    std::println("PUNSUB ALL {}", msgChannels);
+                    // std::println("PUNSUB ALL {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
                   }
 
                   case Command::TERMINATE: {
-                    std::println("TERMINATE");
+                    // std::println("TERMINATE");
                     mqPtr->terminate.store(true, std::memory_order_release);
                     done = true;
                     break;
@@ -513,36 +532,66 @@ namespace RedisCpp {
 
       {
         auto subLock = std::scoped_lock(subscriberMutex);
-        (void)subscriberMap.emplace(subHash, Subscriber{std::jthread(std::move(subscriber), subHash),
-                                                        finished, std::move(messageQueuePtr)});
+        auto [iter, inserted] = subscriberMap.emplace(
+            std::piecewise_construct, std::forward_as_tuple(subHash), std::forward_as_tuple());
+        auto &sub = iter->second;
+        sub.finished = finished;
+        sub.queuePtr = std::move(messageQueuePtr);
+        sub.subThread = std::jthread(std::move(subscriber), std::ref(sub));
       }
+
       return subHash;
-    }  // end subscribe()
+    }  // end subscribe(channels..., cb)
 
-    template <typename... Args>
+    /**
+     * SUBSCRIBE
+     * (id, channels...) overload
+     */
+    template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 1)
-    [[nodiscard]] bool unsubscribe(Args &&...args) {
-      auto argsTuple = std::forward_as_tuple(std::forward<Args>(args)...);
+    [[nodiscard]] bool subscribe(uint64_t subId, Args &&...args) {
       constexpr std::size_t N{sizeof...(Args)};
-      using argDecltype = decltype(argsTuple);
+      auto allChannels = std::array<std::string_view, N>{std::string_view(std::forward<Args>(args))...};
 
-      static_assert(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<0, argDecltype>>, uint64_t>,
-                    "unsubscribe: first argument must be uint64_t");
-      uint64_t subId{std::get<0>(argsTuple)};
+      auto [channels, patChannels] =
+          [this](
+              auto &channelVec) -> std::pair<std::vector<std::string_view>, std::vector<std::string_view>> {
+        std::vector<std::string_view> chans, patChans;
+        chans.reserve(channelVec.size() + 1);
+        patChans.reserve(channelVec.size() + 1);
 
-      auto allChannels = [&]<std::size_t... I>(std::index_sequence<I...>) -> std::vector<std::string_view> {
-        static_assert(((std::convertible_to<std::decay_t<std::tuple_element_t<I + 1, argDecltype>>,
-                                            std::string_view>) &&
-                       ...),
-                      "unsubscribe: channel args must be string_view-like");
-        static_assert(
-            (!(std::is_same_v<std::remove_cvref_t<std::tuple_element_t<I + 1, argDecltype>>, std::string> &&
-               std::is_rvalue_reference_v<std::tuple_element_t<I + 1, argDecltype>>) &&
-             ...),
-            "unsubscribe: rvalue std::string not allowed (temporary, "
-            "would dangle)");
-        return std::vector<std::string_view>{std::string_view{std::get<I + 1>(argsTuple)}...};
-      }(std::make_index_sequence<N - 1>{});
+        for (auto &c : channelVec) {
+          auto &v = isSubscribePattern(c) ? patChans : chans;
+          v.emplace_back(c);
+        }
+        return std::make_pair(chans, patChans);
+      }(allChannels);
+
+      auto subscriberEntry = subscriberMap.find(subId);
+      if (subscriberEntry == subscriberMap.end()) return false;
+      auto &sub = subscriberEntry->second;
+      sub.ready.wait();
+      {
+        auto qLock = std::scoped_lock(sub.queuePtr->queueMutex);
+        if (!channels.empty()) {
+          sub.queuePtr->messages.push_back(Message{Command::SUBSCRIBE, std::move(channels)});
+        }
+        if (!patChannels.empty()) {
+          sub.queuePtr->messages.push_back(Message{Command::PSUBSCRIBE, std::move(patChannels)});
+        }
+      }
+      sub.queuePtr->wakeup();
+
+      return true;
+    }  // end subscribe(id, channels...)
+
+    /**
+     * UNSUBSCRIBE
+     */
+    template <satisfies_stringview... Args>
+    [[nodiscard]] bool unsubscribe(uint64_t subId, Args &&...args) {
+      constexpr std::size_t N{sizeof...(Args)};
+      auto allChannels = std::array<std::string_view, N>{std::string_view(std::forward<Args>(args))...};
 
       auto [channels, patChannels] =
           [this](
@@ -561,6 +610,7 @@ namespace RedisCpp {
       auto subscriberEntry = subscriberMap.find(subId);
       if (subscriberEntry != subscriberMap.end()) {
         auto &sub = subscriberEntry->second;
+        sub.ready.wait();
         {
           auto qLock = std::scoped_lock(sub.queuePtr->queueMutex);
           if (channels.empty() && patChannels.empty()) {
@@ -721,7 +771,6 @@ namespace RedisCpp {
                                            Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
       auto argv = std::array<std::string_view, N>{dir, key, std::string_view(std::forward<Args>(args))...};
-      std::println("LPUSH: {}", argv);
       return commandArgv(argv);
     }
 
