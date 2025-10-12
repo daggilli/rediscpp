@@ -46,10 +46,11 @@
 
 #include "redisconfig.hpp"
 
-using namespace std::string_literals;
-using namespace std::chrono_literals;
-
 namespace RedisCpp {
+  namespace fs = std::filesystem;
+  using namespace std::string_literals;
+  using namespace std::chrono_literals;
+
   inline std::once_flag sigSetup;
 
   constexpr int tcpTimeoutMillis = 3600 * 1000;
@@ -106,6 +107,7 @@ namespace RedisCpp {
   using IdGenerator = RandomInt::RandomUint64Generator;
   using HmapEntry = std::pair<std::string, std::string>;
   using HmapVec = std::vector<HmapEntry>;
+  using ScriptMap = std::unordered_map<std::string, std::string>;
 
   // ensure arguments are string_view or can construct a string_view
   // implicitly. Do not allow rvalue refs (temporaries) because they
@@ -173,7 +175,7 @@ namespace RedisCpp {
 
     [[nodiscard]] std::optional<std::string> get(const std::string_view &key) {
       auto getReply = commandArgv({"GET", key});
-      if (replyOk(context.get(), getReply, REDIS_REPLY_STRING)) {
+      if (stringReplyOk(context.get(), getReply)) {
         return getReply->str;
       }
 
@@ -641,6 +643,82 @@ namespace RedisCpp {
       }
     }
 
+    [[nodiscard]] std::optional<std::string> loadScriptFromFile(const std::string &scriptName,
+                                                                const fs::path &scriptFilePath) {
+      auto filepath = fs::weakly_canonical(fs::absolute(scriptFilePath));
+      if (!fs::exists(filepath))
+        throw std::runtime_error(std::format("Configuration file not found at: {}", filepath.string()));
+      auto fsize = fs::file_size(filepath);
+      std::unique_ptr<uint8_t[]> inbuffer;
+
+      {
+        std::ifstream infile;
+        infile.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+        try {
+          infile.open(filepath.c_str(), std::ios::in | std::ifstream::binary);
+        } catch (const std::ifstream::failure &e) {
+          throw std::runtime_error(std::format("Can't open input file {}: {} ({}: {})", filepath.string(),
+                                               e.what(), e.code().value(), e.code().message()));
+        }
+        try {
+          inbuffer = std::make_unique_for_overwrite<uint8_t[]>(fsize);
+        } catch (const std::bad_alloc &e) {
+          throw;
+        }
+        auto buf = std::bit_cast<char *>(inbuffer.get());
+        infile.read(buf, fsize);
+      }
+
+      auto script = std::string_view{std::bit_cast<char *>(inbuffer.get()), fsize};
+
+      return loadScript(scriptName, script);
+    }
+
+    [[nodiscard]] std::optional<std::string> loadScript(const std::string &scriptName,
+                                                        const std::string_view script) {
+      auto replyPtr = commandArgv(context.get(), {"SCRIPT", "LOAD", script});
+
+      if (stringReplyOk(context.get(), replyPtr)) {
+        (void)scriptHashes.insert_or_assign(scriptName, replyPtr->str);
+        return replyPtr->str;
+      }
+
+      return std::nullopt;
+    }
+
+    template <satisfies_stringview... Args>
+    [[nodiscard]] ReplyPointer evaluate(const std::string &scriptName, size_t numKeys, Args &&...args) {
+      auto scriptHash = scriptHashes.find(scriptName);
+      if (scriptHash == scriptHashes.end()) return ReplyPointer{};
+      return evaluateBySha(scriptHash->second, numKeys, std::forward<Args>(args)...);
+    }
+
+    template <satisfies_stringview... Args>
+    [[nodiscard]] ReplyPointer evaluateBySha(const std::string &sha, size_t numKeys, Args &&...args) {
+      constexpr size_t N = 3 + sizeof...(Args);
+      auto nk = std::to_string(numKeys);
+      auto argv =
+          std::array<std::string_view, N>{"EVALSHA", sha, nk, std::string_view(std::forward<Args>(args))...};
+      return commandArgv(argv);
+    }
+
+    [[nodiscard]] inline ReplyPointer flushScripts() {
+      scriptHashes.clear();
+      return commandArgv(context.get(), {"SCRIPT", "FLUSH"});
+    }
+
+    template <satisfies_stringview... Args>
+    [[nodiscard]] inline ReplyPointer scriptExistsBySha(Args &&...args) {
+      constexpr size_t N = 2 + sizeof...(Args);
+      auto argv =
+          std::array<std::string_view, N>{"SCRIPT", "EXISTS", std::string_view(std::forward<Args>(args))...};
+      return commandArgv(argv);
+    }
+
+    /*************************************************************************************** */
+    /**************************************** PRIvATE ****************************************/
+    /*************************************************************************************** */
+
    private:
     Config config;
     ContextPointer context;
@@ -649,6 +727,7 @@ namespace RedisCpp {
     mutable std::mutex subscriberMutex;
     SubscriberMap subscriberMap;
     IdGenerator idGen;
+    ScriptMap scriptHashes;
     std::jthread reaperThread;
 
     template <typename... Args>
@@ -860,6 +939,10 @@ namespace RedisCpp {
 
     inline bool intReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
       return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_INTEGER);
+    }
+
+    inline bool stringReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {
+      return (replyPtr != nullptr && !ctx->err && replyPtr->type == REDIS_REPLY_STRING);
     }
 
     inline bool statusReplyOk(redisContext *ctx, ReplyPointer const &replyPtr) noexcept {

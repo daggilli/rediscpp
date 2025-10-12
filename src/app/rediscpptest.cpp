@@ -34,6 +34,19 @@ int main(int argc, char* argv[]) {
   RedisCpp::Config cfg("config/redisconfig.json");
   auto client = RedisCpp::Client(cfg);
 
+#if 1
+  // auto scriptHash = client.loadScript("fooscript", "return 'Lua script is foomatic'");
+  auto scriptHash = client.loadScriptFromFile("fooscript", "scripts/setkey.lua");
+  std::string sha;
+  std::println("SCRPT SHA {}", scriptHash.value_or("BAD LOAD"));
+  if (scriptHash.has_value()) {
+    sha = scriptHash.value();
+    // auto result = client.evaluateBySha(sha, 1, "wtfkey", "a value");
+    auto result = client.evaluate("fooscript", 1, "wtfkey", "another value");
+    // std::println("RES {} {}", result->type, result->str);
+    std::println("RES {}", result->type);
+  }
+#endif
 #if 0
   // auto pub = client.publish("testch", "a message");
 
@@ -85,7 +98,7 @@ int main(int argc, char* argv[]) {
   std::println("SISM {}", sism);
 #endif
 
-#if 1
+#if 0
   SubscriptionHandler sh("thing1"), sh2("thing2");
 
   auto suba = client.subscribe("testch", "channel2", "wildcard*", sh);
