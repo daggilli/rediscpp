@@ -46,6 +46,30 @@ int main(int argc, char* argv[]) {
     // std::println("RES {} {}", result->type, result->str);
     std::println("RES {}", result->type);
   }
+  auto mems = client.smembers("fooset");
+  if (mems.has_value()) {
+    std::println("SMEMS: {}", mems.value());
+  }
+
+  std::println("APP SCR EX {}", client.scriptExists("fooscript"));
+
+  auto exists = client.exists("fooset", "foohash");
+  std::println("EXISTS {}", exists);
+
+  auto lpop = client.lpop("nlist", 2);
+  if (lpop.has_value()) {
+    std::println("LPOP {}", lpop.value());
+  }
+
+  // (void)client.lpush("nlist", "foo", "bar", "baz", "zomg", "wtf", "bbq");
+
+  auto lran = client.lrange("nlist", 0, -1);
+  if (lran.has_value()) {
+    for (auto& v : lran.value()) {
+      std::print("{} ", v);
+    }
+    std::println("");
+  }
 #endif
 #if 0
   // auto pub = client.publish("testch", "a message");

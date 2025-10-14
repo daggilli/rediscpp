@@ -51,6 +51,11 @@ target_compile_options(${EXE} PRIVATE
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${ENABLE_ASAN}>>:-fsanitize=address>
 )
 
+target_compile_definitions(${EXE} PRIVATE
+    $<$<CONFIG:Debug>:REDISCPP_DEBUG=1>
+    $<$<CONFIG:Release>:REDISCPP_RELEASE=1>
+)
+
 target_link_options(${EXE} PRIVATE
   $<$<CONFIG:Release>: -Wl,--gc-sections -Wl,--as-needed>
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${ENABLE_ASAN}>>:-fsanitize=address>
