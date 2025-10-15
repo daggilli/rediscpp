@@ -101,3 +101,20 @@ install(FILES
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/${PROJECT_NAME}/cmake)
 
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/ DESTINATION include)
+
+find_package(Doxygen REQUIRED)
+get_filename_component(PROJECT_ROOT "${CMAKE_SOURCE_DIR}" DIRECTORY)
+set(DOCS_OUT "${PROJECT_ROOT}/docs")
+set(DOCS_INPUT "${PROJECT_ROOT}/src")
+
+configure_file(
+  ${CMAKE_SOURCE_DIR}/doxygen/Doxyfile.in
+  ${CMAKE_BINARY_DIR}/Doxyfile
+  @ONLY
+)
+
+add_custom_target(docs
+  COMMAND ${DOXYGEN_EXECUTABLE} ${CMAKE_BINARY_DIR}/Doxyfile
+  COMMENT "Generating documentation in ${DOCS_OUT}"
+  VERBATIM
+)

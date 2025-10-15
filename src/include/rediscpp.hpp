@@ -57,45 +57,97 @@ namespace RedisCpp {
   constexpr auto blockingTimeoutSecs = "1";  // interpreted as double so "0.25" = 250ms
   constexpr auto blockingNoTimeout = "0";
 
+  /**
+   * @brief The custom deleter for the RAII `std::unique_ptr` that encapsulates a `redisReply` pointer
+   *
+   */
   struct ReplyDeleter {
     void operator()(redisReply *reply) const noexcept {
       if (reply) ::freeReplyObject(reply);
     }
   };
 
+  /**
+   * @brief The custom deleter for the RAII `std::unique_ptr` that encapsulates a `redisContext` pointer
+   *
+   */
   struct ContextDeleter {
     void operator()(redisContext *ctx) const noexcept {
       if (ctx) ::redisFree(ctx);
     }
   };
 
+  /**
+   * @brief Command words for communication with running subscriber instances
+   *
+   */
   enum class Command { SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, UNSUBSCRIBEALL, TERMINATE };
 
+  /**
+   * @brief A message object that can be passed to subscriber instances
+   *
+   * @struct Message
+   */
   struct Message {
-    Command command;
-    std::vector<std::string_view> channels;
+    Command command;                        /**< The command words for the message */
+    std::vector<std::string_view> channels; /**< a list of channels (possibly zero-length) */
   };
 
+  /**
+   * @brief A message queue for communication with running subscribers
+   *
+   * @struct MessageQueue
+   *
+   *
+   * @details A `MessageQueue` object is the means by which an application can communicate with its running
+   * subscribers. An instance of a `MessageQueue` is stored in a `std::shared_ptr` inside an instance of
+   * the `Subscriber` class. Client member functions visible to the application such as `subscribe()`
+   * place objects of type `Message` into the queue and signal the subscriber to process it by writing
+   * to the queue's file descriptor with `MessageQueue::wakeup()`, which the subscriber is moonitoring via
+   * `poll()`. Thread safety is provided by a mutex on which a function attempting to read or write from the
+   * queue must obtain a lock.
+   *
+   */
   struct MessageQueue {
+    /**
+     * @brief Drain the queue's `eventfd` file descriptor to reset it
+     *
+     */
     void drain() {
       uint64_t tmp;
       (void)::read(signalFileDesc, &tmp, sizeof(tmp));
     }
+    /**
+     * @brief Write to the queue's `eventfd` file descriptor to alert the subcriber
+     * that the queue should be read
+     *
+     */
     void wakeup() {
       uint64_t one{1};
       (void)::write(signalFileDesc, &one, sizeof(one));
     }
-    int signalFileDesc{-1};
-    std::mutex queueMutex;
-    std::deque<Message> messages;
-    std::atomic_bool terminate{false};
+    int signalFileDesc{-1};            /**< The `eventfd` file descriptor to signal queue data is ready */
+    std::mutex queueMutex;             /**< A lock on queuen access */
+    std::deque<Message> messages;      /**< The queu */
+    std::atomic_bool terminate{false}; /**< A flag to signal the subscriber to shut dowm */
   };
 
+  /**
+   * @brief An object to handle subscriptions to pob/sub channels
+   *
+   * @details The `Subscriber` object manages subscriptions to Redis publish and subscribe channels. It
+   * listens for incoming messages and despatches them to a callable object for further processing.
+   * Once started, a `Subscriber` runs in an asynchronous context (one thread per subscriber). Communications
+   * between the main thread in which the subscriber was started and the running thread is via a shared
+   * message queue of type `MessageQueue`. Before reading to or writing from the queue, it is locked with a
+   * mutex held in the `MessageQueue` object.
+   *
+   */
   struct Subscriber {
-    std::jthread subThread;
-    std::shared_future<void> finished;
-    std::shared_ptr<MessageQueue> queuePtr;
-    std::latch ready{1};
+    std::jthread subThread;                 /**< The theead in which the subscriber's main body runs */
+    std::shared_future<void> finished;      /**< A flag to indicate the subscriber has ceased operations */
+    std::shared_ptr<MessageQueue> queuePtr; /**< A pointer to the message queue object */
+    std::latch ready{1}; /**< A one-shot latch to indicate the subscriber has completed initialisation */
   };
 
   using ListenerMap = std::unordered_map<std::string, std::jthread>;
@@ -109,9 +161,6 @@ namespace RedisCpp {
   using HmapVec = std::vector<HmapEntry>;
   using ScriptMap = std::unordered_map<std::string, std::string>;
 
-  // ensure arguments are string_view or can construct a string_view
-  // implicitly. Do not allow rvalue refs (temporaries) because they
-  // will dangle
   /**
    * Ensure all elements of a parameter pack are `std::string_view` or capable of being
    * converted to a `std::string_view`. Disallow rvalue `std::string` entries (*i.e.* temporaries)
@@ -122,15 +171,31 @@ namespace RedisCpp {
       std::constructible_from<std::string_view, T> &&
       !(std::same_as<std::remove_cvref_t<T>, std::string> && std::is_rvalue_reference_v<T &&>);
 
+  /**
+   * @class Client
+   *
+   * @brief A Redis client class that provides most commonly-used features
+   *
+   */
   class Client {
    public:
-    explicit Client() = delete;
+    explicit Client() = delete; /**< Default constructor deleted */
+    /**
+     * @brief Construct a new Client object with a supplied configuration
+     *
+     * @param cfg A configuration object of type `Config`
+     */
     explicit Client(const Config &cfg) : config{cfg} {
       Client::setSignals();
       context = createContext(config);
       startReaper();
     }
-    Client(const Client &cli) = delete;
+    Client(const Client &cli) = delete; /**< class cannot be copied */
+    /**
+     * @brief Client object move constructor
+     *
+     * @param cli the `Client` object to be moved
+     */
     Client(Client &&cli) : config{std::move(cli.config)}, context{std::exchange(cli.context, nullptr)} {}
     virtual ~Client() {
       for (auto &[name, lthread] : listeners) {
@@ -138,15 +203,37 @@ namespace RedisCpp {
       }
       listeners.clear();
     }
-    Client operator=(const Client &cli) = delete;
+    Client operator=(const Client &cli) = delete; /**< copy assignment deleted */
+    /**
+     * @brief move assignment is supported
+     *
+     * @param cli The `Client` object to be moved
+     */
     Client &operator=(Client &&cli) {
       config = std::move(cli.config);
       context = std::exchange(cli.context, nullptr);
       return *this;
     }
 
+    /**
+     * @brief Send a command to Redis
+     *
+     * @param format A format string to which `args` will be applied
+     * @param args A paramter pack containing arguments for the command
+     * @return The reply from Redis
+     *
+     * @details This function exposes the `redisCommand` call that can be used to send an arbitrary command to
+     * Redis. The `format` parameter is a string-like object with a command, options and format specifiers
+     * that will be populated with the parameters given in `args` before being sent to the Redis engine. Redis
+     * expects a C-style zero-terminated string for `format`, so overloads for this function have been
+     * provided so that it can be called with string-like objects (`std::string`, `std::string_view`) without
+     * having to worry about the compiler trying to implicitly convert the format string and failing overload
+     * resolution.
+     *
+     */
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(const char *format, Args &&...args) {
+      std::println("CMD CONST CHAR*");
       ReplyPointer replyPtr(
           static_cast<redisReply *>(::redisCommand(context.get(), format, std::forward<Args>(args)...)));
       if (!replyOk(context.get(), replyPtr)) {
@@ -154,7 +241,50 @@ namespace RedisCpp {
       }
       return replyPtr;
     }
+    /**
+     * @brief Overload for `std::string` format
+     *
+     */
+    template <typename... Args>
+    [[nodiscard]] inline ReplyPointer command(const std::string &format, Args &&...args) {
+      std::println("CMD CONST STR&");
+      return command(format.c_str(), std::forward<Args>(args)...);
+    }
 
+    /**
+     * @brief Overload for rvalue `std::string` format
+     *
+     */
+    template <typename... Args>
+    [[nodiscard]] inline ReplyPointer command(const std::string &&format, Args &&...args) {
+      std::println("CMD CONST STR&&");
+      auto fstr = std::move(format);
+      return command(fstr.c_str(), std::forward<Args>(args)...);
+    }
+    /**
+     * @brief Overload for `std::string_view` format
+     *
+     */
+    template <typename... Args>
+    [[nodiscard]] inline ReplyPointer command(const std::string_view format, Args &&...args) {
+      std::println("CMD CONST SVIEW");
+      auto fstr = std::string(format);
+      return command(fstr.c_str(), std::forward<Args>(args)...);
+    }
+
+    /**
+     * @brief Send a command to Redis (ARGV fornat)
+     *
+     * @param args A span (or a container convertible to span) containing the cammand and parameters
+     * @return The reply from Redis
+     *
+     * @details This function exposes the residCommandArgv call that can be used to send an arbitrary command
+     * to Redis. It takes a span-like set of `std::string_view` arguments. This can be an explicit `std::span`
+     * or a containers such as `std::array` or `std::vector` that can be implicitly converted to a span. An
+     * initialiser list can be used to construct a span in C++26 but for C++23 an overload is provided to
+     * enable this behaviour.
+     *
+     */
     [[nodiscard]] inline ReplyPointer commandArgv(std::span<const std::string_view> args) {
       std::vector<const char *> argv;
       argv.reserve(args.size());
@@ -178,6 +308,12 @@ namespace RedisCpp {
     }
 #endif
 
+    /**
+     * @brief Get a value from Redis by its key
+     *
+     * @param key The Redis key
+     * @return a `std::optional` containing the value as a string or `std::nullopt`
+     */
     [[nodiscard]] std::optional<std::string> get(const std::string_view &key) {
       auto getReply = commandArgv({"GET", key});
       if (stringReplyOk(context.get(), getReply)) {
@@ -187,6 +323,15 @@ namespace RedisCpp {
       return std::nullopt;
     }
 
+    /**
+     * @brief Set the value of a key, with options
+     *
+     * @tparam Args
+     * @param key
+     * @param value
+     * @param args
+     * @return ReplyPointer
+     */
     template <satisfies_stringview... Args>
     [[nodiscard]] inline ReplyPointer set(const std::string_view key, const std::string_view &value,
                                           Args &&...args) {
@@ -331,6 +476,7 @@ namespace RedisCpp {
      * @param key the list key
      * @param start the index of the first element in the range
      * @param stop the index of the last element in the range
+     *
      * @return a vector of strings containing the list elements, or `std::nullopt` if none were found
      */
     [[nodiscard]] inline std::optional<std::vector<std::string>> lrange(const std::string key, int start,
@@ -386,9 +532,11 @@ namespace RedisCpp {
 
     /**
      * @brief Subscribe to one or more channels and provide a callback to process received messages
+     *
      * @param args A parameter pack of length N, the first N - 1 of which are the names of channels
      * to which the client should subscribe, and the last being a callable object of type `SubscriberCallback`
      * that will receive the message
+     *
      * @return an opaque 64-bit handle with which to reference the subscriber instance subsequently
      */
     template <typename... Args>
@@ -607,13 +755,18 @@ namespace RedisCpp {
 
     /**
      * @brief Tell an existing subscriber to subscribe to additional channels
+     *
      * @tparam subId the subscriber handle as returned from the initial call to `subscribe()`
      * @param args a parameter pack containing the names of the additional subscription channels
+     *
      * @return a boolean value indicating whether the operation was successful
      */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 1)
     [[nodiscard]] bool subscribe(uint64_t subId, Args &&...args) {
+      auto subscriberEntry = subscriberMap.find(subId);
+      if (subscriberEntry == subscriberMap.end()) return false;
+
       constexpr std::size_t N{sizeof...(Args)};
       auto allChannels = std::array<std::string_view, N>{std::string_view(std::forward<Args>(args))...};
 
@@ -631,8 +784,6 @@ namespace RedisCpp {
         return std::make_pair(chans, patChans);
       }(allChannels);
 
-      auto subscriberEntry = subscriberMap.find(subId);
-      if (subscriberEntry == subscriberMap.end()) return false;
       auto &sub = subscriberEntry->second;
       sub.ready.wait();
       {
@@ -651,12 +802,17 @@ namespace RedisCpp {
 
     /**
      * @brief Tell a subscriber to unsubscribe from some channels
+     *
      * @param the subscriber handle as returned from the initial call to `subscribe()`
      * @param args a parameter pack containing the names of the channels that are to be unsubscribed
+     *
      * @return a boolean value inicating whether the operation was successful
      */
     template <satisfies_stringview... Args>
     [[nodiscard]] bool unsubscribe(uint64_t subId, Args &&...args) {
+      auto subscriberEntry = subscriberMap.find(subId);
+      if (subscriberEntry == subscriberMap.end()) return false;
+
       constexpr std::size_t N{sizeof...(Args)};
       auto allChannels = std::array<std::string_view, N>{std::string_view(std::forward<Args>(args))...};
 
@@ -674,27 +830,34 @@ namespace RedisCpp {
         return std::make_pair(chans, patChans);
       }(allChannels);
 
-      auto subscriberEntry = subscriberMap.find(subId);
-      if (subscriberEntry != subscriberMap.end()) {
-        auto &sub = subscriberEntry->second;
-        sub.ready.wait();
-        {
-          auto qLock = std::scoped_lock(sub.queuePtr->queueMutex);
-          if (channels.empty() && patChannels.empty()) {
-            sub.queuePtr->messages.push_back(Message{Command::UNSUBSCRIBEALL, {}});
-          }
-          if (!channels.empty()) {
-            sub.queuePtr->messages.push_back(Message{Command::UNSUBSCRIBE, std::move(channels)});
-          }
-          if (!patChannels.empty()) {
-            sub.queuePtr->messages.push_back(Message{Command::PUNSUBSCRIBE, std::move(patChannels)});
-          }
+      auto &sub = subscriberEntry->second;
+      sub.ready.wait();
+      {
+        auto qLock = std::scoped_lock(sub.queuePtr->queueMutex);
+        if (channels.empty() && patChannels.empty()) {
+          sub.queuePtr->messages.push_back(Message{Command::UNSUBSCRIBEALL, {}});
         }
-        sub.queuePtr->wakeup();
+        if (!channels.empty()) {
+          sub.queuePtr->messages.push_back(Message{Command::UNSUBSCRIBE, std::move(channels)});
+        }
+        if (!patChannels.empty()) {
+          sub.queuePtr->messages.push_back(Message{Command::PUNSUBSCRIBE, std::move(patChannels)});
+        }
       }
+      sub.queuePtr->wakeup();
+
       return true;
     }  // end unsubscribe()
 
+    /**
+     * @brief Stop a running subscriber instance
+     *
+     * @param subId The subscriber instance's handle passed back from the first call to `subscribe`
+     *
+     * @details This function halts a rumming subscriber, cleans up its entry in the lookup table, and
+     * terminates thread execution. At this point the handle becomes invalid and should not be used again.
+     *
+     */
     void stop(uint64_t subId) {
       auto subscriberEntry = subscriberMap.find(subId);
 
@@ -708,6 +871,14 @@ namespace RedisCpp {
       }
     }
 
+    /**
+     * @brief Load a Lua script file into the script cache and return its SHA1 identifier
+     *
+     * @param scriptName The name under which to store the script identifier in the lookup table
+     * @param scriptFilePath The path to the script file
+     * @return A `std::optional` value containing the SHA1 hash of the script if loading was successful
+     *
+     */
     [[nodiscard]] std::optional<std::string> loadScriptFromFile(const std::string &scriptName,
                                                                 const fs::path &scriptFilePath) {
       auto filepath = fs::weakly_canonical(fs::absolute(scriptFilePath));

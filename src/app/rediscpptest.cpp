@@ -70,6 +70,20 @@ int main(int argc, char* argv[]) {
     }
     std::println("");
   }
+
+  auto abc = std::string_view("abc");
+  std::println("ABC SZ {} {}", abc.size(), (int)*(abc.data() + abc.size()));
+
+  auto abcs = std::string("GET %s");
+  auto abcsv = std::string_view(abcs.data(), abcs.length());
+  std::println("ABCsv SZ {} {}", abcsv.size(), (int)*(abcsv.data() + abcsv.size()));
+
+  (void)client.command("GET %s", "foox");
+  (void)client.command(abcs, "foox");
+  (void)client.command(abcsv, "foox");
+  (void)client.command(std::string("GET %s"), "foox");
+  auto rep = client.command(std::move(abcs), "foox");
+  std::println("REP {}", rep->str);
 #endif
 #if 0
   // auto pub = client.publish("testch", "a message");
