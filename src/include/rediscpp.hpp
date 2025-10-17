@@ -8,12 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <concepts>
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
 #include <deque>
-#include <expected>
 #include <format>
 #include <fstream>
 #include <functional>
@@ -23,7 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <print>
-#include <randomint.hpp>
+#include <random>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -128,7 +128,7 @@ namespace RedisCpp {
     }
     int signalFileDesc{-1};            /**< The `eventfd` file descriptor to signal queue data is ready */
     std::mutex queueMutex;             /**< A lock on queuen access */
-    std::deque<Message> messages;      /**< The queu */
+    std::deque<Message> messages;      /**< The queue */
     std::atomic_bool terminate{false}; /**< A flag to signal the subscriber to shut dowm */
   };
 
@@ -150,15 +150,22 @@ namespace RedisCpp {
     std::latch ready{1}; /**< A one-shot latch to indicate the subscriber has completed initialisation */
   };
 
+  struct RandomGenerator {
+    uint64_t operator()() { return std::uniform_int_distribution<uint64_t>{}(engine); }
+
+    std::mt19937 engine{std::random_device{}()};
+  };
+
   using ListenerMap = std::unordered_map<std::string, std::jthread>;
-  using Callback = std::function<void(std::string_view, std::string_view)>;
+  using ListenerCallback = std::function<void(std::string_view, std::string_view)>;
   using ReplyPointer = std::unique_ptr<redisReply, ReplyDeleter>;
   using ContextPointer = std::unique_ptr<redisContext, ContextDeleter>;
   using SubscriberCallback = std::function<void(std::span<std::string_view>)>;
   using SubscriberMap = std::unordered_map<uint64_t, Subscriber>;
-  using IdGenerator = RandomInt::RandomUint64Generator;
   using HmapEntry = std::pair<std::string, std::string>;
   using HmapVec = std::vector<HmapEntry>;
+  using HmapItem = std::pair<std::string, std::optional<std::string>>;
+  using HmapItemVec = std::vector<HmapItem>;
   using ScriptMap = std::unordered_map<std::string, std::string>;
 
   /**
@@ -176,10 +183,15 @@ namespace RedisCpp {
    *
    * @brief A Redis client class that provides most commonly-used features
    *
+   * @details The `Client` class encapsulates a Redis client connection with functionality to get and set
+   * values, manipulate lists and sets, perform blocking listens on lists, publish and subscribe, and
+   * loading/evaluation of Lua scripts.
+   *
    */
   class Client {
    public:
     explicit Client() = delete; /**< Default constructor deleted */
+
     /**
      * @brief Construct a new Client object with a supplied configuration
      *
@@ -190,30 +202,22 @@ namespace RedisCpp {
       context = createContext(config);
       startReaper();
     }
-    Client(const Client &cli) = delete; /**< class cannot be copied */
-    /**
-     * @brief Client object move constructor
-     *
-     * @param cli the `Client` object to be moved
-     */
-    Client(Client &&cli) : config{std::move(cli.config)}, context{std::exchange(cli.context, nullptr)} {}
+
     virtual ~Client() {
       for (auto &[name, lthread] : listeners) {
         lthread.request_stop();
       }
       listeners.clear();
     }
-    Client operator=(const Client &cli) = delete; /**< copy assignment deleted */
+
     /**
-     * @brief move assignment is supported
+     * Copy and move contructors and assignments are deleted because the class contains mutexes
      *
-     * @param cli The `Client` object to be moved
      */
-    Client &operator=(Client &&cli) {
-      config = std::move(cli.config);
-      context = std::exchange(cli.context, nullptr);
-      return *this;
-    }
+    Client(const Client &) = delete;           /**< Class cannot be copied */
+    Client(Client &&) = delete;                /**< Class cannot be moved */
+    Client operator=(const Client &) = delete; /**< Copy assignment deleted */
+    Client &operator=(Client &&) = delete;     /**< Move assignment deleted */
 
     /**
      * @brief Send a command to Redis
@@ -233,7 +237,6 @@ namespace RedisCpp {
      */
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(const char *format, Args &&...args) {
-      std::println("CMD CONST CHAR*");
       ReplyPointer replyPtr(
           static_cast<redisReply *>(::redisCommand(context.get(), format, std::forward<Args>(args)...)));
       if (!replyOk(context.get(), replyPtr)) {
@@ -241,13 +244,13 @@ namespace RedisCpp {
       }
       return replyPtr;
     }
+
     /**
      * @brief Overload for `std::string` format
      *
      */
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(const std::string &format, Args &&...args) {
-      std::println("CMD CONST STR&");
       return command(format.c_str(), std::forward<Args>(args)...);
     }
 
@@ -257,17 +260,22 @@ namespace RedisCpp {
      */
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(const std::string &&format, Args &&...args) {
-      std::println("CMD CONST STR&&");
       auto fstr = std::move(format);
       return command(fstr.c_str(), std::forward<Args>(args)...);
     }
+
     /**
      * @brief Overload for `std::string_view` format
+     *
+     * @details This overload is necessary because `std::string_view` does not necessarily point to a
+     * null-terminated C-style string, but the underlying `redisCommand()` function takes such a string (in
+     * fact a pointer to `char`). `std::string` has a constructor that can take a `std::string_view` and
+     * produce a string whose underlying null-terminated representation can be accessed by
+     * `std::string::c_str`.
      *
      */
     template <typename... Args>
     [[nodiscard]] inline ReplyPointer command(const std::string_view format, Args &&...args) {
-      std::println("CMD CONST SVIEW");
       auto fstr = std::string(format);
       return command(fstr.c_str(), std::forward<Args>(args)...);
     }
@@ -276,13 +284,14 @@ namespace RedisCpp {
      * @brief Send a command to Redis (ARGV fornat)
      *
      * @param args A span (or a container convertible to span) containing the cammand and parameters
+     *
      * @return The reply from Redis
      *
-     * @details This function exposes the residCommandArgv call that can be used to send an arbitrary command
-     * to Redis. It takes a span-like set of `std::string_view` arguments. This can be an explicit `std::span`
-     * or a containers such as `std::array` or `std::vector` that can be implicitly converted to a span. An
-     * initialiser list can be used to construct a span in C++26 but for C++23 an overload is provided to
-     * enable this behaviour.
+     * @details This function exposes the `redisCommandArgv` call that can be used to send an arbitrary
+     * command to Redis. It takes a span-like set of `std::string_view` arguments. This can be an explicit
+     * `std::span` or a container such as `std::array` or `std::vector` that can be implicitly converted to a
+     * span. An initialiser list can be used to construct a span in C++26 but for C++23 an overload is
+     * provided to enable this behaviour.
      *
      */
     [[nodiscard]] inline ReplyPointer commandArgv(std::span<const std::string_view> args) {
@@ -326,11 +335,16 @@ namespace RedisCpp {
     /**
      * @brief Set the value of a key, with options
      *
-     * @tparam Args
-     * @param key
-     * @param value
-     * @param args
-     * @return ReplyPointer
+     * @param key The Redis key
+     * @param value The value to set for the key
+     * @param args Additional parameters *e.g.* expiry time
+     *
+     * @return The reply from Redis (see documentation for possible values)
+     *
+     * @details This function sets a string value. It optionally takes additional parameters such as `EX` to
+     * set expiry time-to-live or `GET` to return the previously stored value. The exact value of the reply
+     * depends on whether the `GET` parameter was supplied (see the official Redis documentation).
+     *
      */
     template <satisfies_stringview... Args>
     [[nodiscard]] inline ReplyPointer set(const std::string_view key, const std::string_view &value,
@@ -341,6 +355,19 @@ namespace RedisCpp {
       return commandArgv(argv);
     }
 
+    /**
+     * @brief Determine whether a key or keys with the given name exist(s)
+     *
+     * @param args A set of key names whose existence is to be determined
+     *
+     * @return int The number of keys with the given names that exist
+     *
+     * @details The return value of this function is an integer that counts how many of the supplied keys
+     * exist in the database. It does not provide any information on which of the keys exist if more than one
+     * key is supplied. It can only report the information 'some' or 'none' (this is a limitation of the Redis
+     * engine).
+     *
+     */
     template <satisfies_stringview... Args>
     [[nodiscard]] inline int exists(Args &&...args) {
       constexpr size_t N = 1 + sizeof...(Args);
@@ -352,30 +379,104 @@ namespace RedisCpp {
       return replyPtr->integer;
     }
 
+    /**
+     * @brief Delete items given their keys
+     *
+     * @param A list of keys to be deleted
+     *
+     * @return An integer indicating the number of keys that were deleted
+     *
+     */
     template <satisfies_stringview... Args>
-      requires(sizeof...(Args) >= 2)
-    [[nodiscard]] inline ReplyPointer del(const std::string_view key, Args &&...args) {
+      requires(sizeof...(Args) >= 1)
+    [[nodiscard]] inline int del(Args &&...args) {
       constexpr size_t N = 1 + sizeof...(Args);
       auto argv = std::array<std::string_view, N>{"DEL", std::string_view(std::forward<Args>(args))...};
-      return commandArgv(argv);
+      auto replyPtr = commandArgv(argv);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
+    /**
+     * @brief Set key/value pairs in a hash map
+     *
+     * @param key The key of the hashmap
+     * @param args A list of key/value pairs in the form `<key 1> <value 1> <key 2> <value 2> ... <key n>
+     * <value n>`
+     *
+     * @return The number of fields that were added
+     */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 2 && sizeof...(Args) % 2 == 0)
-    [[nodiscard]] inline ReplyPointer hset(const std::string_view key, Args &&...args) {
+    [[nodiscard]] inline int hset(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
       auto argv = std::array<std::string_view, N>{"HSET", key, std::string_view(std::forward<Args>(args))...};
-      return commandArgv(argv);
+      auto replyPtr = commandArgv(argv);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
+    /**
+     * @brief Get a value from a hash map field by key
+     *
+     * @param key The key of the has
+     * @param field The name of the firls
+     *
+     * @return The value contained in the field or `std::nullopt` if no such field exists
+     *
+     */
     [[nodiscard]] inline std::optional<std::string> hget(const std::string_view key,
                                                          const std::string_view field) {
       auto argv = std::array<std::string_view, 3>{"HGET", key, field};
       auto replyPtr = commandArgv(argv);
-      if (replyPtr->type == REDIS_REPLY_NIL) return std::nullopt;
+      if (replyPtr->type != REDIS_REPLY_STRING) return std::nullopt;
       return replyPtr->str;
     }
 
+    /**
+     * @brief Get multiple items from a hash map
+     *
+     * @param key The key of the hash map
+     * @param args A list of fields in the hash map whose values are required
+     *
+     * @return A vector of pairs of string and optional string
+     *
+     * The return value is a `std::vector` of `std::pair` items, each of which is a `std::string` and a
+     * `std::optional<std::string>`. The first element of the pair is the field name passed into the function,
+     * and the second element is the value for the hash map corresponding to that field, or `std::nullopt` if
+     * no such field exists.
+     *
+     */
+    template <satisfies_stringview... Args>
+      requires(sizeof...(Args) > 0)
+    [[nodiscard]] inline HmapItemVec hmget(const std::string &key, Args &&...args) {
+      auto argsVec = std::vector<std::string_view>{std::forward<Args>(args)...};
+      constexpr size_t N = 2 + sizeof...(Args);
+      auto argv =
+          std::array<std::string_view, N>{"HMGET", key, std::string_view(std::forward<Args>(args))...};
+      auto replyPtr = commandArgv(argv);
+      if (!arrayLikeReplyOk(context.get(), replyPtr)) {
+        throw std::runtime_error("HMGET failed");
+      }
+
+      HmapItemVec itemVec;
+      itemVec.reserve(replyPtr->elements);
+      for (auto i{0u}; i < replyPtr->elements; i++) {
+        itemVec.emplace_back(argsVec[i], replyPtr->element[i]->type == REDIS_REPLY_STRING
+                                             ? std::optional<std::string>(replyPtr->element[i]->str)
+                                             : std::nullopt);
+      }
+      return itemVec;
+    }
+
+    /**
+     * @brief Return all key/value pairs in a hash map
+     *
+     * @param key The key of the hash map
+     *
+     * @return A `std::vector` of pairs of `std::string`, or `std::nullopt` if the hash map does not exist
+     *
+     */
     [[nodiscard]] inline std::optional<HmapVec> hgetall(const std::string_view key) {
       auto argv = std::array<std::string_view, 2>{"HGETALL", key};
       auto replyPtr = commandArgv(argv);
@@ -392,37 +493,73 @@ namespace RedisCpp {
       return hashVector;
     }
 
+    /**
+     * @brief Remove fields from a hash map
+     *
+     * @param key The key of the hash map
+     * @param args A list of fields that re to be removed
+     *
+     * @return The number of fields that were deleted
+     *
+     */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 1)
     [[nodiscard]] inline int hdel(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
       auto argv = std::array<std::string_view, N>{"HDEL", key, std::string_view(std::forward<Args>(args))...};
       auto replyPtr = commandArgv(argv);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
       return replyPtr->integer;
     }
 
+    /**
+     * @brief Add a member to a set
+     *
+     * @param key The key of the set
+     * @param args A list of members to be added
+     *
+     * @return The number of items that were added to the set, not including the elements already present.
+     *
+     */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 2)
-    [[nodiscard]] inline ReplyPointer sadd(const std::string_view key, Args &&...args) {
+    [[nodiscard]] inline int sadd(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
       auto argv = std::array<std::string_view, N>{"SADD", key, std::string_view(std::forward<Args>(args))...};
-      return commandArgv(argv);
+      auto replyPtr = commandArgv(argv);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
+    /**
+     * @brief Remove elements from a set
+     *
+     * @param key The key of the set
+     * @param args The elements that are to be removed from the set
+     *
+     * @return The number of elements that were removed from the set
+     */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 2)
-    [[nodiscard]] inline ReplyPointer srem(const std::string_view key, Args &&...args) {
+    [[nodiscard]] inline int srem(const std::string_view key, Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
       auto argv = std::array<std::string_view, N>{"SREM", key, std::string_view(std::forward<Args>(args))...};
-      return commandArgv(argv);
+      auto replyPtr = commandArgv(argv);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
+    /**
+     * @brief Get all the members of a set
+     *
+     * @param key The key of the set
+     *
+     * @return A `std::vector` of `std::string`, or `std::nullopt` if no elements were returned
+     *
+     */
     [[nodiscard]] inline std::optional<std::vector<std::string>> smembers(const std::string_view key) {
       auto argv = std::array<std::string_view, 2>{"SMEMBERS", key};
       auto replyPtr = commandArgv(argv);
-#if REDISCPP_DEBUG
-      std::println("SMEMBERS REPLY PTR:\n{}", dumpReply(replyPtr));
-#endif
       bool (Client::*okFunc)(redisContext *ctx, ReplyPointer const &replyPtr) =
           config.useResp3 ? &Client::setReplyOk : &Client::arrayLikeReplyOk;
       if (!(this->*okFunc)(context.get(), replyPtr)) {
@@ -438,6 +575,15 @@ namespace RedisCpp {
       return setVector;
     }
 
+    /**
+     * @brief Determine if a value is a member of a set
+     *
+     * @param key The key of the set
+     * @param member The element to be queried
+     *
+     * @return A boolean value indicating whether the member was present in the set
+     *
+     */
     [[nodiscard]] inline bool sismember(const std::string_view key, const std::string_view member) {
       auto argv = std::array<std::string_view, 3>{"SISMEMBER", key, member};
       auto replyPtr = commandArgv(argv);
@@ -447,27 +593,105 @@ namespace RedisCpp {
       return static_cast<bool>(replyPtr->integer);
     }
 
+    /**
+     * @brief Push values onto the right-hand side of a list
+     *
+     * @param key The key of the list
+     * @param args A list of items to be pushed onto the list
+     *
+     * @return The length of the list after the push operation
+     *
+     * @detail The queue listeners pop items from the left-hand side of a list, so this is the function to
+     * use for standard FIFO queue behaviour.
+     *
+     */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) > 0)
-    [[nodiscard]] inline ReplyPointer rpush(const std::string_view key, Args &&...args) {
-      return push("RPUSH", key, std::forward<Args>(args)...);
+    [[nodiscard]] inline int rpush(const std::string_view key, Args &&...args) {
+      auto replyPtr = push("RPUSH", key, std::forward<Args>(args)...);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
+    /**
+     * @brief Push values onto the left-hand side of a list
+     *
+     * @param key The key of the list
+     * @param args A list of items to be pushed onto the list
+     *
+     * @return The length of the list after the push operation
+     *
+     */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) > 0)
-    [[nodiscard]] inline ReplyPointer lpush(const std::string_view key, Args &&...args) {
-      return push("LPUSH", key, std::forward<Args>(args)...);
+    [[nodiscard]] inline int lpush(const std::string_view key, Args &&...args) {
+      auto replyPtr = push("LPUSH", key, std::forward<Args>(args)...);
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
+    /**
+     * @brief Pop an item or items from the left-hand side of a list
+     *
+     * @param key The key of the list
+     * @param count How many items to pop (default 1)
+     *
+     * @return A `std::vector` of `std::string` or `std::nullopt` if no items were popped
+     *
+     */
     [[nodiscard]] inline std::optional<std::vector<std::string>> lpop(const std::string_view key,
                                                                       size_t count = 1) {
-      std::println("LPOP KEY {}", key);
       return pop("LPOP", key, count);
     }
 
+    /**
+     * @brief Pop an item or items from the right-hand side of a list
+     *
+     * @param key The key of the list
+     * @param count How many items to pop (default 1)
+     *
+     * @return A `std::vector` of `std::string` or `std::nullopt` if no items were popped
+     *
+     */
     [[nodiscard]] inline std::optional<std::vector<std::string>> rpop(const std::string_view key,
                                                                       size_t count = 1) {
       return pop("RPOP", key, count);
+    }
+
+    /**
+     * @brief Remove elements from a list
+     *
+     * @param key The key of the list
+     * @param count How many instances of element to remove
+     * @param element The element to remove
+     *
+     * @return The numder of elements removed
+     */
+    [[nodiscard]] inline int lrem(const std::string_view key, int count, const std::string_view element) {
+      auto cnt = std::to_string(count);
+      auto argv = std::array<std::string_view, 4>{"LREM", key, cnt, element};
+      auto replyPtr = commandArgv(argv);
+      if (!intReplyOk(context.get(), replyPtr)) {
+        throw std::runtime_error("LREM failed");
+      }
+      return replyPtr->integer;
+    }
+
+    /**
+     * @brief Get the length of a list
+     *
+     * @param key The key of the list
+     *
+     * @return The number of items in the list
+     *
+     */
+    [[nodiscard]] inline int llen(const std::string_view key) {
+      auto argv = std::array<std::string_view, 2>{"LLEN", key};
+      auto replyPtr = commandArgv(argv);
+      if (!intReplyOk(context.get(), replyPtr)) {
+        throw std::runtime_error("LLEN failed");
+      }
+      return replyPtr->integer;
     }
 
     /**
@@ -479,7 +703,7 @@ namespace RedisCpp {
      *
      * @return a vector of strings containing the list elements, or `std::nullopt` if none were found
      */
-    [[nodiscard]] inline std::optional<std::vector<std::string>> lrange(const std::string key, int start,
+    [[nodiscard]] inline std::optional<std::vector<std::string>> lrange(const std::string_view key, int start,
                                                                         int stop) {
       auto stt = std::to_string(start);
       auto stp = std::to_string(stop);
@@ -496,17 +720,43 @@ namespace RedisCpp {
       return itemVec;
     }
 
-    [[nodiscard]] inline ReplyPointer publish(const std::string_view channel,
-                                              const std::string_view message) {
-      return commandArgv({"PUBLISH", channel, message});
+    /**
+     * @brief Publish a message to a subscription channel
+     *
+     * @param channel The name of the channel
+     * @param message The message text
+     *
+     * @return The number of subscribers to which the message was published
+     *
+     */
+    [[nodiscard]] inline int publish(const std::string_view channel, const std::string_view message) {
+      auto replyPtr = commandArgv({"PUBLISH", channel, message});
+      if (replyPtr->type != REDIS_REPLY_INTEGER) return 0;
+      return replyPtr->integer;
     }
 
-    bool addListener(const std::string queueName, Callback cb) {
+    /**
+     * @brief Add a listener to a queue and set a callback
+     *
+     * @param queueName The name of the queue to listen on
+     * @param callback The callable object to process received messages
+     *
+     * @return A boolean value indicating whether the listener was successfully added
+     *
+     * @details This function adds a listener to a Redis queue (which is a list object). It launches a thread
+     * which performa a blocking pop operation on the __left__ end of the queue. For FIFO queue behaviour,
+     * items should be added to the queue with `RPUSH`. The `queueName` paraneter is a string that identifies
+     * the queue for future reference. The `callback` parameter is a callable object (a lambda, a struct or
+     * class implmenting `operator()` etc.) of type `ListenerCallback`. The callback expects two parameters
+     * that are compatible with `std::string_view`, and returns nothing.
+     *
+     */
+    bool addListener(const std::string queueName, ListenerCallback callback) {
       auto lock = std::scoped_lock(listenerMutex);
       if (auto lthread = listeners.find(queueName); lthread != listeners.end() && lthread->second.joinable())
         return false;
 
-      auto listener = [this, qn = queueName, handler = std::move(cb)](std::stop_token tok) mutable {
+      auto listener = [this, qn = queueName, handler = std::move(callback)](std::stop_token tok) mutable {
         auto ctx = createContext(config);
 
         while (!tok.stop_requested()) {
@@ -523,9 +773,18 @@ namespace RedisCpp {
       return wasInserted;
     }
 
+    /**
+     * @brief Remove a listener from a queue and terminate its thread
+     *
+     * @param queueName The name of the listener's queue
+     *
+     * @return A boolean value indicating whether the removal was successful
+     *
+     */
     bool removeListener(const std::string &queueName) {
       auto lock = std::scoped_lock(listenerMutex);
       auto lthread = listeners.find(queueName);
+      if (lthread == listeners.end()) return false;
       lthread->second.request_stop();
       return listeners.erase(queueName) > 0;
     }
@@ -533,11 +792,19 @@ namespace RedisCpp {
     /**
      * @brief Subscribe to one or more channels and provide a callback to process received messages
      *
-     * @param args A parameter pack of length N, the first N - 1 of which are the names of channels
+     * @param args A parameter pack of length N > 1, the first N - 1 of which are the names of channels
      * to which the client should subscribe, and the last being a callable object of type `SubscriberCallback`
      * that will receive the message
      *
      * @return an opaque 64-bit handle with which to reference the subscriber instance subsequently
+     *
+     * @details The `args` parameter is an arbitrary-length set of arguments representing a list of channels
+     * followed by a callback to handle received messages: `<channel 1> <channel 2> ... <channel N>
+     * <callback>`. The callnack parameter must be a callable object (free function, lambda etc.) that
+     * conforms to the `SubscriberCallback` specification. A `SubscriberCallback` object takes a `std::span`
+     * of `std::string_view` and returns nothing:\n
+     * `    using SubscriberCallback = std::function<void(std::span<std::string_view>)>;`
+     *
      */
     template <typename... Args>
       requires(sizeof...(Args) >= 2)
@@ -645,21 +912,18 @@ namespace RedisCpp {
                 switch (msg.command) {
                   case Command::SUBSCRIBE: {
                     msgChannels.insert(msgChannels.begin(), "SUBSCRIBE");
-                    // std::println("ADD SUB {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
                   }
                   case Command::PSUBSCRIBE: {
                     msgChannels.insert(msgChannels.begin(), "PSUBSCRIBE");
-                    // std::println("ADD PSUB {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
                   }
                   case Command::UNSUBSCRIBE: {
                     msgChannels.insert(msgChannels.begin(), "UNSUBSCRIBE");
-                    // std::println("UNSUB {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
@@ -667,7 +931,6 @@ namespace RedisCpp {
 
                   case Command::PUNSUBSCRIBE: {
                     msgChannels.insert(msgChannels.begin(), "PUNSUBSCRIBE");
-                    // std::println("PUNSUB {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
@@ -675,18 +938,15 @@ namespace RedisCpp {
 
                   case Command::UNSUBSCRIBEALL: {
                     msgChannels.insert(msgChannels.begin(), "UNSUBSCRIBE");
-                    // std::println("UNSUB ALL {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     msgChannels.at(0) = "PUNSUBSCRIBE";
-                    // std::println("PUNSUB ALL {}", msgChannels);
                     (void)appendCommandArgv(ctx.get(), msgChannels);
                     (void)flushPending(ctx.get());
                     break;
                   }
 
                   case Command::TERMINATE: {
-                    // std::println("TERMINATE");
                     mqPtr->terminate.store(true, std::memory_order_release);
                     done = true;
                     break;
@@ -756,10 +1016,11 @@ namespace RedisCpp {
     /**
      * @brief Tell an existing subscriber to subscribe to additional channels
      *
-     * @tparam subId the subscriber handle as returned from the initial call to `subscribe()`
+     * @param subId the subscriber handle as returned from the initial call to `subscribe()`
      * @param args a parameter pack containing the names of the additional subscription channels
      *
      * @return a boolean value indicating whether the operation was successful
+     *
      */
     template <satisfies_stringview... Args>
       requires(sizeof...(Args) >= 1)
@@ -803,10 +1064,11 @@ namespace RedisCpp {
     /**
      * @brief Tell a subscriber to unsubscribe from some channels
      *
-     * @param the subscriber handle as returned from the initial call to `subscribe()`
+     * @param subId the subscriber handle as returned from the initial call to `subscribe()`
      * @param args a parameter pack containing the names of the channels that are to be unsubscribed
      *
-     * @return a boolean value inicating whether the operation was successful
+     * @return A boolean value inicating whether the operation was successful
+     *
      */
     template <satisfies_stringview... Args>
     [[nodiscard]] bool unsubscribe(uint64_t subId, Args &&...args) {
@@ -910,6 +1172,13 @@ namespace RedisCpp {
       return loadScript(scriptName, script);
     }
 
+    /**
+     * @brief Load a string containing a Lua script into the script cache and return its SHA1 identifier
+     *
+     * @param scriptName The name under which to store the script identifier in the lookup table
+     * @param script The text of the Lua script
+     * @return A `std::optional` value containing the SHA1 hash of the script if loading was successful
+     */
     [[nodiscard]] std::optional<std::string> loadScript(const std::string &scriptName,
                                                         const std::string_view script) {
       auto replyPtr = commandArgv(context.get(), {"SCRIPT", "LOAD", script});
@@ -922,6 +1191,16 @@ namespace RedisCpp {
       return std::nullopt;
     }
 
+    /**
+     * @brief Evaluate a Lue script given its name in the lookup table
+     *
+     * @param scriptName The name of the script in the lookup table
+     * @param numKeys The number of entries in `args` that are keys
+     * @param args A parameter pack of keys and arguments to be passed to the Lua script
+     *
+     * @return The result of the evaluation
+     *
+     */
     template <satisfies_stringview... Args>
     [[nodiscard]] ReplyPointer evaluate(const std::string &scriptName, size_t numKeys, Args &&...args) {
       auto scriptHash = scriptHashes.find(scriptName);
@@ -929,6 +1208,16 @@ namespace RedisCpp {
       return evaluateBySha(scriptHash->second, numKeys, std::forward<Args>(args)...);
     }
 
+    /**
+     * @brief Evaluate a Lue script given its SHA1 hash
+     *
+     * @param scriptName The SHA1 hash of the script
+     * @param numKeys The number of entries in `args` that are keys
+     * @param args A parameter pack of keys and arguments to be passed to the Lua script
+     *
+     * @return The result of the evaluation
+     *
+     */
     template <satisfies_stringview... Args>
     [[nodiscard]] ReplyPointer evaluateBySha(const std::string &sha, size_t numKeys, Args &&...args) {
       constexpr size_t N = 3 + sizeof...(Args);
@@ -938,11 +1227,29 @@ namespace RedisCpp {
       return commandArgv(argv);
     }
 
-    [[nodiscard]] inline ReplyPointer flushScripts() {
+    /**
+     * @brief Flush all scripts from the script cache and cleat the lookup table
+     *
+     * @param async Flush the scripts asynchronously
+     *
+     * @return A boolean value inicating whether the operation was successful
+     */
+    [[nodiscard]] inline bool flushScripts(bool async = false) {
       scriptHashes.clear();
-      return commandArgv(context.get(), {"SCRIPT", "FLUSH"});
+      auto flushArgs = async ? std::vector<std::string_view>{"SCRIPT", "FLUSH", "ASYNC"}
+                             : std::vector<std::string_view>{"SCRIPT", "FLUSH"};
+      auto replyPtr = commandArgv(context.get(), flushArgs);
+      return replyPtr->type == REDIS_REPLY_STATUS && replyPtr->str == "OK"s;
     }
 
+    /**
+     * @brief Determine whether a script with the given name exists in the script cache
+     *
+     * @param name The name of the script in the lookup table
+     *
+     * @return A boolean value indicating whether the script exists
+     *
+     */
     [[nodiscard]] inline bool scriptExists(const std::string &name) {
       auto hash = scriptHashes.find(name);
       if (hash == scriptHashes.end()) return false;
@@ -956,6 +1263,14 @@ namespace RedisCpp {
       return true;
     }
 
+    /**
+     * @brief Determine whether a script with the given SHA1 hash exists in the script cache
+     *
+     * @param name The SHA1 hash of the script
+     *
+     * @return A boolean value indicating whether the script exists
+     *
+     */
     template <satisfies_stringview... Args>
     [[nodiscard]] inline ReplyPointer scriptsExistBySha(Args &&...args) {
       constexpr size_t N = 2 + sizeof...(Args);
@@ -975,7 +1290,7 @@ namespace RedisCpp {
     ListenerMap listeners;
     mutable std::mutex subscriberMutex;
     SubscriberMap subscriberMap;
-    IdGenerator idGen;
+    RandomGenerator idGen;
     ScriptMap scriptHashes;
     std::jthread reaperThread;
 
@@ -1105,10 +1420,8 @@ namespace RedisCpp {
     [[nodiscard]] inline std::optional<std::vector<std::string>> pop(const std::string_view &dir,
                                                                      const std::string_view &key,
                                                                      size_t count) {
-      std::println("POP INTERNAL");
       auto cnt = std::to_string(count);
       auto argv = std::array<std::string_view, 3>{dir, key, cnt};
-      std::println("POP ARGV {}", argv);
       auto replyPtr = commandArgv(argv);
       if (replyPtr->type == REDIS_REPLY_NIL) return std::nullopt;
       if (!arrayLikeReplyOk(context.get(), replyPtr)) {
@@ -1272,7 +1585,7 @@ namespace RedisCpp {
         if (type == REDIS_REPLY_ERROR || type == REDIS_REPLY_STRING || type == REDIS_REPLY_STATUS ||
             type == REDIS_REPLY_DOUBLE || type == REDIS_REPLY_BIGNUM || type == REDIS_REPLY_VERB) {
           out << indent << "len: " << reply->len << "\n"
-              << indent << "str: " << (reply->str == nullptr ? "nullptr" : reply->str) << "\n ";
+              << indent << "str: " << (reply->str == nullptr ? "nullptr" : reply->str) << "\n";
         }
         if (type == REDIS_REPLY_VERB) {
           out << indent << "vtype: " << reply->vtype << "\n";
@@ -1314,6 +1627,6 @@ namespace RedisCpp {
         sigaction(SIGPIPE, &sigAct, nullptr);
       });
     }
-  };
+  };  // end class Client
 };  // namespace RedisCpp
 #endif

@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.28)
 project(RedisCpp LANGUAGES CXX VERSION 1.0.0)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
-set(EXE rediscpptest)
-
 if(CMAKE_GENERATOR MATCHES "Ninja Multi-Config")
   set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
   set(CMAKE_DEFAULT_BUILD_TYPE "Release" CACHE STRING "" FORCE)
@@ -14,16 +12,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_compile_options(-Wall -Wunused -Wnrvo)
 
-set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
-set(CMAKE_INSTALL_RPATH "/usr/local/gcc-15/lib64")
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-
 # Suppress warnings about deprecated is_trivial_v in C++26
 if(CMAKE_CXX_STANDARD GREATER_EQUAL 26)
     add_compile_options(-Wno-deprecated)
 endif()
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/app/$<CONFIG>")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/$<CONFIG>")
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 
 list(PREPEND CMAKE_PREFIX_PATH "/usr/local/lib/cmake/hiredis")
@@ -31,10 +25,6 @@ find_package(hiredis)
 
 list(PREPEND CMAKE_PREFIX_PATH "/usr/local/jsoncpp-1.9.7")
 find_package(jsoncpp CONFIG REQUIRED)
-
-find_package(randomint)
-
-add_executable(${EXE} app/${EXE}.cpp)
 
 add_library(${PROJECT_NAME} INTERFACE)
 
@@ -44,6 +34,21 @@ target_include_directories(
   $<BUILD_INTERFACE:${${PROJECT_NAME}_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+
+list(APPEND Examples
+  client  
+  config
+  getsetdel
+  hashmap
+  list
+  listener
+  produceconsume
+  pubsub
+  set
+)
+
+foreach(EXE IN LISTS Examples)
+add_executable(${EXE} examples/${EXE}.cpp)
 
 target_compile_options(${EXE} PRIVATE
   $<$<CONFIG:Debug>:-g -O1 -fno-omit-frame-pointer>
@@ -61,7 +66,7 @@ target_link_options(${EXE} PRIVATE
   $<$<AND:$<CONFIG:Debug>,$<BOOL:${ENABLE_ASAN}>>:-fsanitize=address>
 )
 
-target_precompile_headers(${EXE} PRIVATE <format> <print> <json/value.h> <json/reader.h>)
+target_precompile_headers(${EXE} PRIVATE <format> <print> <json/value.h> <json/reader.h> "include/rediscpp.hpp" "include/redisconfig.hpp")
 
 if (TARGET jsoncpp_lib)
   set_property(TARGET jsoncpp_lib PROPERTY MAP_IMPORTED_CONFIG_DEBUG Release)
@@ -71,6 +76,7 @@ endif ()
 
 target_link_libraries(${EXE} PRIVATE ${PROJECT_NAME})
 target_link_libraries(${EXE} PRIVATE hiredis)
+endforeach()
 
 include(GNUInstallDirs)
 
