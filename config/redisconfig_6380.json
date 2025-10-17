@@ -1,8 +1,0 @@
-{
-  "hostname": "localhost",
-  "port": 6380,
-  "db": 6,
-  "useresp3": true,
-  "useauth": true,
-  "password": "pw6380"
-}

@@ -1,0 +1,5 @@
+{
+  "hostname": "redis-server",
+  "port": 26379,
+  "useresp3": true
+}
