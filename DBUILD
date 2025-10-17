@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-TARGET=""
+TARGET="examples"
 if [[ $# -ge 1 ]]; then
-  TARGET="--target $1"
+  TARGET=$1
 fi
-cmake --build build $TARGET --config Debug
+cmake --build build --target $TARGET --config Debug -- -j$(nproc)
+

@@ -1,2 +1,4 @@
 #!/usr/bin/env bash
 sudo cmake --build build --target install
+UGID="$(id -un):$(id -gn)"
+sudo chown -R $UGID build
