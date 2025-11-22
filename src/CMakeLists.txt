@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.28)
 project(RedisCpp LANGUAGES CXX VERSION 1.0.0)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(CUSTOM_LIBSTDCPP_DIR "/usr/local/lib64")
+
+  # Ensure runtime finds the right libstdc++
+  set(CMAKE_SKIP_BUILD_RPATH FALSE)
+  set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+
+  set(CMAKE_BUILD_RPATH "${CUSTOM_LIBSTDCPP_DIR}")
+  set(CMAKE_INSTALL_RPATH "${CUSTOM_LIBSTDCPP_DIR}")
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
+
 if(CMAKE_GENERATOR MATCHES "Ninja Multi-Config")
   set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
   set(CMAKE_DEFAULT_BUILD_TYPE "Release" CACHE STRING "" FORCE)
@@ -14,7 +26,7 @@ add_compile_options(-Wall -Wunused -Wnrvo)
 
 # Suppress warnings about deprecated is_trivial_v in C++26
 if(CMAKE_CXX_STANDARD GREATER_EQUAL 26)
-    add_compile_options(-Wno-deprecated)
+  add_compile_options(-Wno-deprecated)
 endif()
 
 option(BUILD_EXAMPLES "Build example executables" OFF)
@@ -24,10 +36,29 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/examples/$<CONFIG>")
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 
 list(PREPEND CMAKE_PREFIX_PATH "/usr/local/lib/cmake/hiredis")
-find_package(hiredis)
+find_package(hiredis QUIET CONFIG)
 
-list(PREPEND CMAKE_PREFIX_PATH "/usr/local/jsoncpp-1.9.7")
-find_package(jsoncpp CONFIG REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+if(NOT hiredis_FOUND)
+  message(STATUS "hiredis CMake package not found, falling back to pkg-config")
+  pkg_check_modules(HIREDIS REQUIRED hiredis)
+
+  add_library(hiredis::hiredis INTERFACE IMPORTED)
+
+  set_target_properties(hiredis::hiredis PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${HIREDIS_INCLUDE_DIRS}"
+      INTERFACE_LINK_LIBRARIES      "${HIREDIS_LIBRARIES}"
+  )
+endif()
+
+pkg_check_modules(JSONCPP REQUIRED jsoncpp)
+add_library(JsonCpp::JsonCpp INTERFACE IMPORTED)
+
+set_target_properties(JsonCpp::JsonCpp PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES "${JSONCPP_INCLUDE_DIRS}"
+  INTERFACE_LINK_LIBRARIES      "${JSONCPP_LIBRARIES}"
+)
 
 add_library(${PROJECT_NAME} INTERFACE)
 
@@ -62,6 +93,10 @@ list(APPEND Examples
   set
 )
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(ENABLE_ASAN OFF CACHE BOOL "Enable AddressSanitizer (Debug builds)" FORCE)
+endif()
+
 foreach(EXE IN LISTS Examples)
   add_executable(${EXE} examples/${EXE}.cpp)
 
@@ -81,11 +116,7 @@ foreach(EXE IN LISTS Examples)
     $<$<AND:$<CONFIG:Debug>,$<BOOL:${ENABLE_ASAN}>>:-fsanitize=address>
   )
 
-  if (TARGET jsoncpp_lib)
-    set_property(TARGET jsoncpp_lib PROPERTY MAP_IMPORTED_CONFIG_DEBUG Release)
-    set_property(TARGET jsoncpp_lib PROPERTY MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
-    target_link_libraries(${EXE} PRIVATE jsoncpp_lib)
-  endif ()
+  target_link_libraries(${EXE} PRIVATE JsonCpp::JsonCpp)
 
   target_link_libraries(${EXE} PRIVATE ${PROJECT_NAME})
   target_link_libraries(${EXE} PRIVATE hiredis)
