@@ -1,16 +1,12 @@
 #pragma once
-
-#include <json/reader.h>
-#include <json/value.h>
-
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <toml++/toml.hpp>
+#include <utility>
 
 namespace RedisCpp {
   namespace fs = std::filesystem;
@@ -66,47 +62,37 @@ namespace RedisCpp {
       auto filepath = fs::weakly_canonical(fs::absolute(configFilePath));
       if (!fs::exists(filepath))
         throw std::runtime_error(std::format("Configuration file not found at: {}", filepath.string()));
-      auto fsize = fs::file_size(filepath);
 
-      std::unique_ptr<uint8_t[]> inbuffer;
-      {
-        std::ifstream infile;
-        infile.exceptions(std::ifstream::failbit | std::ifstream::badbit);
-        try {
-          infile.open(filepath.c_str(), std::ios::in | std::ifstream::binary);
-        } catch (const std::ifstream::failure &e) {
-          throw std::runtime_error(std::format("Can't open input file {}: {} ({}: {})", filepath.string(),
-                                               e.what(), e.code().value(), e.code().message()));
-        }
-        try {
-          inbuffer = std::make_unique_for_overwrite<uint8_t[]>(fsize);
-        } catch (const std::bad_alloc &e) {
-          throw;
-        }
-        auto buf = std::bit_cast<char *>(inbuffer.get());
-        infile.read(buf, fsize);
+      toml::table config;
 
-        JSONCPP_STRING err;
-        Json::Value root;
-        Json::CharReaderBuilder builder;
-        const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
-        if (!reader->parse(buf, buf + fsize, &root, &err)) {
-          throw std::runtime_error(std::format("Config file parse error: {}", err));
-        }
+      try {
+        config = toml::parse_file(configFilePath.string());
+      } catch (const toml::parse_error &err) {
+        throw std::runtime_error(
+            std::format("Failed to parse configuration file {}:\n{}", filepath.string(), err.description()));
+      }
 
-        hostname = root.isMember("hostname") ? root["hostname"].asString() : DEFAULT_HOST;
-        port = root.isMember("port") ? root["port"].asInt() : DEFAULT_PORT;
-        if (root.isMember("db")) {
-          db = root["db"].asInt();
-        }
-        useResp3 = root.isMember("useresp3") ? root["useresp3"].asBool() : true;
-        useAuth = root.isMember("useauth") && root.isMember("password") ? root["useauth"].asBool() : false;
-        if (useAuth) {
-          password = std::optional<std::string>(root["password"].asString());
-          if (root.isMember("username")) {
-            username = root["username"].asString();
-          }
-        }
+      auto redis = config["redis"];
+
+      if (!redis.is_table()) {
+        throw std::runtime_error(std::format("Missing [redis] section in {}", filepath.string()));
+      }
+
+      hostname = redis["hostname"].value_or(DEFAULT_HOST);
+      port = redis["port"].value_or(DEFAULT_PORT);
+      db = redis["db"].value<int>();
+      if (db.has_value()) {
+        db = std::clamp(db.value(), 0, 15);
+      }
+      useResp3 = redis["useresp3"].value_or(true);
+      auto auth = redis["useauth"].value_or(false);
+      std::optional<std::string> un = redis["username"].value<std::string>();
+      std::optional<std::string> pw = redis["password"].value<std::string>();
+
+      if (auth && pw.has_value()) {
+        useAuth = true;
+        if (un.has_value()) username = un;
+        password = pw;
       }
     }
 
@@ -164,7 +150,7 @@ namespace RedisCpp {
     friend std::string text(Config const &cfg) {
       return std::format(
           "hostname: {}\n    port: {}\n      db: {}\n useAuth: {}\nusername: {}\npassword: {}\nuseResp3: {}",
-          cfg.hostname, cfg.port, cfg.db.value_or(0), cfg.useAuth, cfg.username.value_or("nill"),
+          cfg.hostname, cfg.port, cfg.db.value_or(0), cfg.useAuth, cfg.username.value_or("nil"),
           cfg.password.value_or("nil"), cfg.useResp3);
     }
 

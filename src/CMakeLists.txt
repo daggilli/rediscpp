@@ -38,6 +38,8 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 list(PREPEND CMAKE_PREFIX_PATH "/usr/local/lib/cmake/hiredis")
 find_package(hiredis QUIET CONFIG)
 
+find_package(tomlplusplus REQUIRED)
+
 find_package(PkgConfig REQUIRED)
 
 if(NOT hiredis_FOUND)
@@ -52,14 +54,6 @@ if(NOT hiredis_FOUND)
   )
 endif()
 
-pkg_check_modules(JSONCPP REQUIRED jsoncpp)
-add_library(JsonCpp::JsonCpp INTERFACE IMPORTED)
-
-set_target_properties(JsonCpp::JsonCpp PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "${JSONCPP_INCLUDE_DIRS}"
-  INTERFACE_LINK_LIBRARIES      "${JSONCPP_LIBRARIES}"
-)
-
 add_library(${PROJECT_NAME} INTERFACE)
 
 target_include_directories(
@@ -71,13 +65,13 @@ target_include_directories(
 
 # Include this project's headers if not under active development
 # target_precompile_headers(${PROJECT_NAME} INTERFACE
-#   <format> <print> <json/value.h> <json/reader.h>
+#   <format> <print>
 #   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/rediscppimpl.hpp>"
 #   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/rediscppconfig.hpp>"
 # )
 
 target_precompile_headers(${PROJECT_NAME} INTERFACE
-  <format> <print> <json/value.h> <json/reader.h>
+  <format> <print> <toml++/toml.hpp>
 )
 
 list(APPEND Examples
@@ -116,7 +110,6 @@ foreach(EXE IN LISTS Examples)
     $<$<AND:$<CONFIG:Debug>,$<BOOL:${ENABLE_ASAN}>>:-fsanitize=address>
   )
 
-  target_link_libraries(${EXE} PRIVATE JsonCpp::JsonCpp)
 
   target_link_libraries(${EXE} PRIVATE ${PROJECT_NAME})
   target_link_libraries(${EXE} PRIVATE hiredis)

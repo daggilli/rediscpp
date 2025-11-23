@@ -40,11 +40,11 @@ int main() {
   std::println("\n{}", cfg_move);
 
   /**
-   * A Config can be loaded from a file containing a JSON object
+   * A Config can be loaded from a file containing TOML
    *
    */
-  RedisCpp::Config cfg_file("config/config_example.json");
-  std::println("\nFrom JSON file:\n{}", cfg_file);
+  RedisCpp::Config cfg_file("config/config_example.toml");
+  std::println("\nFrom TOML file:\n{}", cfg_file);
 
   return 0;
 }
