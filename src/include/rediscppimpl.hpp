@@ -350,7 +350,7 @@ namespace RedisCpp {
      *
      */
     template <satisfies_stringview... Args>
-    [[nodiscard]] inline ReplyPointer set(const std::string_view key, const std::string_view &value,
+    [[nodiscard]] inline ReplyPointer set(const std::string_view key, const std::string_view value,
                                           Args &&...args) {
       constexpr size_t N = 3 + sizeof...(Args);
       auto argv =
