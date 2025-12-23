@@ -95,7 +95,7 @@ foreach(EXE IN LISTS Examples)
   add_executable(${EXE} examples/${EXE}.cpp)
 
   target_compile_options(${EXE} PRIVATE
-    $<$<CONFIG:Debug>:-g -O1 -fno-omit-frame-pointer>
+    $<$<CONFIG:Debug>:-g -O1 -DDEBUG -fno-omit-frame-pointer>
     $<$<CONFIG:Release>: -O4 -DNODEBUG -ffunction-sections -fdata-sections -fno-plt>
     $<$<AND:$<CONFIG:Debug>,$<BOOL:${ENABLE_ASAN}>>:-fsanitize=address>
   )
