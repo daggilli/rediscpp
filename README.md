@@ -46,13 +46,21 @@ On the other hand, code such as:
 
 is perfectly acceptable (albeit fairly useless) as `std::string_view` does not take ownership of the `"abc"` string literal.
 
+Most of the public member functions of the the `RedisCpp::Client` class are ref-qualified `&`. This is to prevent the use of temporaries. In other words, code such as the following will fail to compile:
+
+```cpp
+RedisCpp::Client(RedisCpp::Config{"localhost", 6379}).get("foo");
+```
+
+This is intentional.
+
 ### Client configuration
 
 An instance of `RedisCpp::Client` requires a configuration of type `RedisCpp::Config`. This must at least specify the server URL and port number.
 
 A constructor for `RedisCpp::Config` exists to specify parameters individually, which takes mandatory values for the server host and port. Additional parameters control the database number to use (0-15), whether to use basic AUTH to connect, the username and password if so, and whether to upgrade the protocol to the RESP3 standard.
 
-The `RedisCpp::config` class has the following shape:
+The `RedisCpp::Config` class has the following shape:
 
 ```cpp
 std::string hostname;
@@ -65,18 +73,29 @@ std::optional<bool> useResp3;
 
 ```
 
-A client configuration can be created by providing the path to a JSON file containing a suitable object specification. The JSON object in this files should have the following shape:
+A client configuration can be created by providing the path to a TOML file containing a suitable object specification. The TOML object in this files should have the following shape:
 
-```json
-{
-  "hostname": (string),
-  "port": (int),
-  "db": (int 0-15, optional, default 0),
-  "useauth": (boolean, optional, default false),
-  "username": (string, optional, default null)
-  "password": (string, optional, default null),
-  "useresp3": (boolean, optional, default true)
-}
+```toml
+[redis]
+hostname = <string>
+port = <int>
+db = <int 0-15, optional, default 0>
+useauth = <boolen, optional, default false>
+username = <string, optional, default null>
+password = <string, optional, default null>
+useresp3 = <boolean, optional, default true>
+```
+
+Thus a possibel config file could looke like:
+
+```toml
+[redis]
+hostname = "redis-server"
+port = 26379
+db = 12
+useauth = true
+username = "redisuser"
+password = "jWhbkZmt"
 ```
 
 Note that key names in this object are all **lowercase**.
