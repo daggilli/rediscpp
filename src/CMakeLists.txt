@@ -1,3 +1,5 @@
+# Copyright (c) 2025–2026 David Gillies
+# SPDX-License-Identifier: BSD-3-Clause
 cmake_minimum_required(VERSION 3.28)
 project(RedisCpp LANGUAGES CXX VERSION 1.0.0)
 set(CMAKE_VERBOSE_MAKEFILE ON)

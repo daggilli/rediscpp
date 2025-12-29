@@ -116,3 +116,10 @@ int main() {
 ```
 
 Note that the connection to Redis is closed when the `Client` object goes out of scope. If a persistent connection is required it must be kept alive in some fashion (this is left to the user).
+
+---
+
+<sup><sub>
+Copyright (c) 2025–2026 David Gillies<br>
+SPDX-License-Identifier: BSD-3-Clause
+<sub><sup>
