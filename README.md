@@ -12,19 +12,19 @@ A modern C++ compiler is required. The minimum standard that will compile cleanl
 
 RedisCpp is built on top of [hiredis](https://github.com/redis/hiredis). The hiredis library and development headers must ne installed.
 
-Parsing the configuration file uses [jsoncpp](https://github.com/open-source-parsers/jsoncpp) and this must be installed along with tis header files.
+Parsing the configuration file uses [TOML++](https://github.com/marzer/tomlplusplus) and this must be installed along with tis header files.
 
-If cross-compiling, the target machine will need the hiredis and jsoncpp libraries.
+If cross-compiling, the target machine will need the hiredis and TOML++ libraries.
 
 Building the documentation requires [Doxygen](https://doxygen.nl/index.html).
 
 ### Installation
 
-Navigate to the project root. The included `CMAKE` script will prepare the necessary makefiles. Then `INSTALL` will copy the required files to `/usr/local/bin`. Package configuration files for `cmake` will be written to `/usr/local/share/RedisCpp/cmake` so the libary can be located with `find_package` in your project's `CMakeLists.txt` file. To build the examples, use the `DBUILD` and `RBUILD` scripts to create the Debug and Release versions respectively. The documentation can be generated with the `DOCS` script (assuming you have Doxygen installed).
+Navigate to the project root. The included `CMAKE` script will prepare the necessary makefiles. Then `INSTALL` will copy the required files to `/usr/local/include`. Package configuration files for `cmake` will be written to `/usr/local/share/RedisCpp/cmake` so the libary can be located with `find_package` in your project's `CMakeLists.txt` file. To build the examples, use the `DBUILD` and `RBUILD` scripts to create the Debug and Release versions respectively. The documentation can be generated with the `DOCS` script (assuming you have Doxygen installed).
 
 ### Usage
 
-The library is header-only. By default it is installed in `/usr/local/bin`. Typically, simply `#include <rediscpp.hpp>`. This includes two subheaders, `rediscppimpl.hpp` and `rediscppconfig.hpp` which can be included individually in your project if you do not need the functionality of one of them.
+The library is header-only. By default it is installed in `/usr/local/include`. Typically, simply `#include <rediscpp.hpp>`. This includes two subheaders, `rediscppimpl.hpp` and `rediscppconfig.hpp` which can be included individually in your project if you do not need the functionality of one of them.
 
 ### Example code
 
@@ -86,7 +86,7 @@ password = <string, optional, default null>
 useresp3 = <boolean, optional, default true>
 ```
 
-Thus a possibel config file could looke like:
+Thus a possible config file could looke like:
 
 ```toml
 [redis]
@@ -103,7 +103,7 @@ Note that key names in this object are all **lowercase**.
 A typical preamble for a program using this library might be as follows:
 
 ```cpp
-#include <rediscpp.h>
+#include <rediscpp.hpp>
 
 int main() {
   RedisCpp::Config config("path/to/config");
