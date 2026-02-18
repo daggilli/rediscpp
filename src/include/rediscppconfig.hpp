@@ -32,7 +32,14 @@ namespace RedisCpp {
     friend class Client;
 
    public:
-    explicit Config(const std::string &hostname_, int port_, int db_ = 0,
+    explicit Config()
+        : hostname{DEFAULT_HOST},
+          port{DEFAULT_PORT},
+          db{std::nullopt},
+          username{std::nullopt},
+          password{std::nullopt},
+          useResp3{true} {}
+    explicit Config(const std::string &hostname_, int port_, std::optional<int> db_ = std::nullopt,
                     std::optional<std::string> un_ = std::nullopt,
                     std::optional<std::string> pw_ = std::nullopt, bool ur3_ = true)
         : hostname{hostname_}, port{port_}, db{db_}, username(un_), password(pw_), useResp3(ur3_) {

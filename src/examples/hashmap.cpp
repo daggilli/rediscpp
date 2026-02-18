@@ -1,8 +1,6 @@
-#include <format>
 #include <print>
 
-#include "rediscppconfig.hpp"
-#include "rediscppimpl.hpp"
+#include "rediscpp.hpp"
 
 int main() {
   RedisCpp::Config config("localhost", 6379);

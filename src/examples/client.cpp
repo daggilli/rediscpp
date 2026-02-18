@@ -1,15 +1,17 @@
-#include <format>
-#include <print>
-
-#include "rediscppconfig.hpp"
-#include "rediscppimpl.hpp"
+#include "rediscpp.hpp"
 
 int main() {
   /**
-   * A Client needs a Config
+   * A default constructed client will use a default Config
    *
    */
-  RedisCpp::Config config("localhost", 6379);
+  RedisCpp::Client defclient;
+
+  /**
+   * A Client needs a Config if not using default host and port
+   *
+   */
+  RedisCpp::Config config("127.0.0.1", 6380);
   RedisCpp::Client client(config);
 
   /**

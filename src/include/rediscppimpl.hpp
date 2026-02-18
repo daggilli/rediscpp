@@ -194,7 +194,15 @@ namespace RedisCpp {
    */
   class Client {
    public:
-    explicit Client() = delete; /**< Default constructor deleted */
+    /**
+     * @brief Construct a new Client object with default configuration
+     *
+     */
+    explicit Client() {
+      Client::setSignals();
+      context = createContext(config);
+      startReaper();
+    }
 
     /**
      * @brief Construct a new Client object with a supplied configuration

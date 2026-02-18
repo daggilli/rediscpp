@@ -1,15 +1,21 @@
-#include <format>
 #include <print>
 
 #include "rediscppconfig.hpp"
 
 int main() {
   /**
+   * Default constructor will use RedisCpp::DEFAULT_HOST and RedisCpp::DEFAULT_PORT
+   *
+   */
+  RedisCpp::Config cfg_default;
+  std::println("{}", cfg_default);
+
+  /**
    * Explicit constructor only needs hostname and port; all other parameters are optional
    *
    */
-  RedisCpp::Config cfg_hostport("localhost", 6379);
-  std::println("{}", cfg_hostport);
+  RedisCpp::Config cfg_hostport("redishost", 16379);
+  std::println("\n{}", cfg_hostport);
 
   /**
    * The db parameter sets the database number we will use
